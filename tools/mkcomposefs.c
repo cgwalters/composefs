@@ -515,6 +515,7 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 	dir_path = argv[0];
+	const bool from_stdin = strcmp(dir_path, "-") == 0;
 
 	if (argc > 2) {
 		fprintf(stderr, "Too many arguments\n");
@@ -561,9 +562,15 @@ int main(int argc, char **argv)
 			error(EXIT_FAILURE, errno, "failed to open output file");
 	}
 
-	root = lcfs_build(AT_FDCWD, dir_path, buildflags, &failed_path);
-	if (root == NULL)
-		error(EXIT_FAILURE, errno, "error accessing %s", failed_path);
+	if (from_stdin) {
+		root = lcfs_build_from_stream(stdin);
+		if (root == NULL)
+			error(EXIT_FAILURE, errno, "failed to build from stream");
+	} else {
+		root = lcfs_build(AT_FDCWD, dir_path, buildflags, &failed_path);
+		if (root == NULL)
+			error(EXIT_FAILURE, errno, "error accessing %s", failed_path);
+	}
 
 	if (absolute_path) {
 		cleanup_free char *cwd_cleanup = NULL;

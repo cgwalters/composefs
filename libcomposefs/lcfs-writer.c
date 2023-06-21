@@ -29,8 +29,11 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <stdint.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <linux/limits.h>
+#include <stdlib.h>
 #include <sys/xattr.h>
 #include <sys/param.h>
 #include <assert.h>
@@ -39,6 +42,17 @@ static void lcfs_node_remove_all_children(struct lcfs_node_s *node);
 static void lcfs_node_destroy(struct lcfs_node_s *node);
 
 static int lcfs_close(struct lcfs_ctx_s *ctx);
+
+static void lcfs_node_unrefp(void *pp)
+{
+	struct lcfs_node_s *node = *(void **)pp;
+	if (node) {
+		PROTECT_ERRNO;
+		lcfs_node_unref(node);
+	}
+}
+
+#define cleanup_node __attribute__((cleanup(lcfs_node_unrefp)))
 
 char *maybe_join_path(const char *a, const char *b)
 {
@@ -1101,6 +1115,230 @@ fail:
 		closedir(dir);
 	errno = errsv;
 	return NULL;
+}
+
+// This header structure is read as a single unit, and contains the byte count for
+// for variable-length trailing sections after it.
+struct lcfs_node_serialized_header {
+	uint32_t uid;
+	uint32_t gid;
+	uint32_t mode; // Must contain exactly one of S_IFDIR | S_IFREG | S_IFLNK
+	uint64_t mtime_sec; // Modification time seconds
+	uint32_t mtime_nsec; // Modification time, nanosecond component
+	uint64_t size; // Size of the data stream after the xattrs
+} __attribute__((packed));
+
+static bool read_xattrs_from_stream(struct lcfs_node_s *node, FILE *f)
+{
+	size_t bytes_read;
+	char uint8_buf[sizeof(uint32_t)];
+	cleanup_free char *xattr_namebuf = NULL;
+	size_t xattr_namebuf_len = -1;
+	cleanup_free uint8_t *xattr_valuebuf = NULL;
+	size_t xattr_valuebuf_len = -1;
+
+	while (true) {
+		bytes_read = fread(&uint8_buf, 1, sizeof(uint8_buf), f);
+		if (bytes_read < 0)
+			return false;
+		uint32_t xattr_len = *(uint32_t *)uint8_buf;
+		if (xattr_len == 0) {
+			break;
+		}
+
+		if ((xattr_len + 1) > xattr_namebuf_len) {
+			xattr_namebuf = realloc(xattr_namebuf, xattr_len + 1);
+			if (xattr_namebuf == NULL)
+				return false;
+		}
+		bytes_read = fread(xattr_namebuf, xattr_len, 1, f);
+		if (bytes_read < 0)
+			return false;
+		xattr_namebuf[xattr_len] = '\0';
+
+		bytes_read = fread(&uint8_buf, 1, sizeof(uint8_buf), f);
+		if (bytes_read < 0)
+			return false;
+		xattr_len = *(uint32_t *)uint8_buf;
+		if (xattr_len == 0) {
+			break;
+		}
+
+		if (xattr_len > xattr_valuebuf_len) {
+			xattr_valuebuf = realloc(xattr_valuebuf, xattr_len);
+			if (xattr_valuebuf == NULL)
+				return false;
+		}
+
+		if (lcfs_node_set_xattr(node, xattr_namebuf,
+					(char *)xattr_valuebuf, xattr_len) < 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Basic verification of a filename; must be non-empty, and cannot
+// contain a slash '/' character.
+static bool validate_filename(const char *filename)
+{
+	if (strchr(filename, '/') != NULL)
+		return false;
+	if (filename[0] == '\0')
+		return false;
+	return true;
+}
+
+static bool read_entry(struct lcfs_node_s *node, FILE *f)
+{
+	ssize_t bytes_read;
+	struct lcfs_node_serialized_header h = {
+		0,
+	};
+	bytes_read = fread(&h, sizeof(h), 1, f);
+	if (bytes_read <= 0)
+		return false;
+
+	node->inode.st_uid = lcfs_u32_from_file(h.uid);
+	node->inode.st_gid = lcfs_u32_from_file(h.gid);
+	node->inode.st_mode = lcfs_u32_from_file(h.mode);
+	node->inode.st_size = lcfs_u64_from_file(h.size);
+	node->inode.st_mtim_sec = lcfs_u64_from_file(h.mtime_sec);
+	node->inode.st_mtim_sec = lcfs_u32_from_file(h.mtime_nsec);
+
+	if (!read_xattrs_from_stream(node, f)) {
+		fprintf(stderr, "failed to read xattrs\n");
+		return false;
+	}
+
+	return true;
+}
+
+static bool read_dir(struct lcfs_node_s *node, FILE *f)
+{
+	ssize_t bytes_read;
+	uint32_t filename_len;
+	while (true) {
+		bytes_read = fread(&filename_len, sizeof(filename_len), 1, f);
+		if (bytes_read <= 0) {
+			return NULL;
+		}
+		fprintf(stderr, "read dir %d\n", (int) bytes_read);
+		filename_len = lcfs_u32_from_file(filename_len);
+		fprintf(stderr, "filename len %u\n", filename_len);
+
+		// Zero length filename means we're done
+		if (filename_len == 0)
+			return node;
+
+		// Sanity check
+		if (filename_len > PATH_MAX) {
+			fprintf(stderr, "invalid filename len\n");
+			errno = EINVAL;
+			return NULL;
+		}
+
+		cleanup_free char *filename = malloc(filename_len + 1);
+		if (!filename)
+			return NULL;
+
+		bytes_read = fread(filename, filename_len, 1, f);
+		if (bytes_read < 0)
+			return NULL;
+		filename[filename_len] = '\0';
+		if (!validate_filename(filename)) {
+			fprintf(stderr, "invalid filename\n");
+			errno = EINVAL;
+			return NULL;
+		}
+		cleanup_node struct lcfs_node_s *child = lcfs_node_new();
+		if (!read_entry(child, f))
+			return NULL;
+
+		if (S_ISDIR(child->inode.st_mode)) {
+			if (!read_dir(child, f))
+				return NULL;
+		} else if (S_ISLNK(child->inode.st_mode) ||
+			   (S_ISREG(child->inode.st_mode) &&
+			    child->inode.st_size > 0)) {
+			uint32_t payload_len;
+			bytes_read = fread(&payload_len, sizeof(payload_len), 1, f);
+			if (bytes_read <= 0)
+				return NULL;
+			payload_len = lcfs_u32_from_file(payload_len);
+			// Sanity check
+			if (payload_len == 0 || payload_len > PATH_MAX) {
+				errno = EINVAL;
+				return NULL;
+			}
+			cleanup_free char *payload_data = malloc(payload_len + 1);
+			if (!payload_data)
+				return NULL;
+			bytes_read =
+				fread(payload_data, payload_len, 1, f);
+			if (bytes_read < 0)
+				return NULL;
+			payload_data[payload_len] = '\0';
+			fprintf(stderr, "set payload %s\n", payload_data);
+			child->payload = steal_pointer(&payload_data);
+		} else if (S_ISREG(child->inode.st_mode)) {
+			assert(child->inode.st_size == 0);
+		} else {
+			fprintf(stderr, "invalid entry\n");
+			errno = EINVAL;
+			return NULL;
+		}
+
+		fprintf(stderr, "adding node %p\n", node);
+		if (lcfs_node_add_child(node, steal_pointer(&child), filename) < 0) {
+			fprintf(stderr, "failed to add child\n");
+			return NULL;
+		}
+	}
+
+	if (node == NULL) {
+		errno = EBADMSG;
+		return NULL;
+	}
+	return steal_pointer(&node);
+}
+
+// lcfs_build_from_stream:
+// Construct a composefs filesystem tree from the provided input stream,
+// which is a repeating set of headers.  All integer values are in host endianness.
+// The structure of a STREAM is:
+//
+// STREAM: DIRECTORY
+// u8: A byte
+// u32: A 32 bit unsigned integer, in host endianness
+// ARRAY(T): [u32] [T]
+// DIRECTORY: ENTRY (FILENAME ENTRY)* | FILENAME-ZERO - a filename of length zero terminates
+// HEADER: (structure defined above)
+// ENTRY: HEADER ARRAY(XATTR) PAYLOAD
+// FILENAME: ARRAY(u8)
+// XATTR: U32 KEY U32 VALUE    # each sub-component is a length-prefixed; zero length key terminates iteration
+// PAYLOAD: For non-empty regular files, this is ARRAY(u8): the redirect to underlying file path.  For symlinks, this is ARRAY(u8) - the link target.  For directories, must be empty.
+LCFS_EXTERN struct lcfs_node_s *lcfs_build_from_stream(FILE *f)
+{
+	cleanup_node struct lcfs_node_s *node = lcfs_node_new();
+	fprintf(stderr, "reading\n");
+	if (!read_entry(node, f)) {
+		fprintf(stderr, "failed to read entry\n");
+		return NULL;
+	}
+	fprintf(stderr, "read\n");
+	if (!S_ISDIR(node->inode.st_mode)) {
+		fprintf(stderr, "not a dir\n");
+		errno = EINVAL;
+		return NULL;
+	}
+
+	fprintf(stderr, "reading dir\n");
+	if (!read_dir(node, f)) {
+		fprintf(stderr, "failed to read topdir\n");
+		return NULL;
+	}
+	return steal_pointer(&node);
 }
 
 size_t lcfs_node_get_n_xattr(struct lcfs_node_s *node)

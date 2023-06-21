@@ -395,6 +395,8 @@ static void compute_erofs_inode_size(struct lcfs_node_s *node)
 		compute_erofs_dir_size(node);
 	} else if (type == S_IFLNK) {
 		node->erofs_n_blocks = 0;
+		fprintf(stderr, "link %p\n", node);
+		assert(node->payload);
 		node->erofs_tailsize = strlen(node->payload);
 	} else if (type == S_IFREG && file_size > 0) {
 		uint32_t chunkbits = compute_erofs_chunk_bitsize(node);
