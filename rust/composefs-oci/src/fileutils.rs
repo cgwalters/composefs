@@ -9,7 +9,10 @@ use cap_std_ext::{
     },
     cap_tempfile::TempFile,
 };
-use rustix::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use rustix::{
+    fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+    fs::openat,
+};
 
 /// The default permissions set for directories; we assume
 /// nothing else should be accessing this content.  If you want
@@ -87,10 +90,22 @@ pub(crate) fn openat_rooted(
     rustix::fs::openat2(
         dirfd,
         path.as_ref(),
-        OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::DIRECTORY,
+        OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::PATH,
         rustix::fs::Mode::empty(),
         ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_XDEV,
     )
+}
+
+/// Not all operations can be performed on an O_PATH directory; e.g.
+/// fsetxattr() can't.
+pub fn fsetxattr<Fd: AsFd>(
+    fd: Fd,
+    name: &str,
+    value: &[u8],
+    flags: rustix::fs::XattrFlags,
+) -> rustix::io::Result<()> {
+    let path = format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd());
+    rustix::fs::setxattr(&path, name, value, flags)
 }
 
 /// Manual implementation of recursive dir walking using openat2

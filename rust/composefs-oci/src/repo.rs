@@ -1,11 +1,12 @@
 use std::borrow::Cow;
 use std::cell::OnceCell;
+use std::fs::File;
 use std::io::{self, BufRead, Seek, Write};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::SyncSender;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 use camino::Utf8Path;
@@ -20,7 +21,7 @@ use composefs::fsverity::Digest;
 use composefs::mkcomposefs::{self, mkcomposefs};
 use fn_error_context::context;
 use rustix::fd::{AsRawFd, BorrowedFd};
-use rustix::fs::AtFlags;
+use rustix::fs::{openat, AtFlags};
 use serde::{Deserialize, Serialize};
 
 use crate::fileutils;
@@ -142,7 +143,10 @@ fn test_fsverity_in(d: &Dir) -> Result<bool> {
     Ok(composefs::fsverity::fsverity_enable(tf.as_file().as_fd()).is_ok())
 }
 
-struct ImportContext<'r> {
+struct ImportContext {
+    has_verity: bool,
+    /// Reference to global objects
+    global_objects: Dir,
     // Temporary directory for layer import;
     // This contains:
     //  - objects/   Regular file content (not fsync'd yet!)
@@ -154,8 +158,172 @@ struct ImportContext<'r> {
     // cap-std which doesn't use RESOLVE_BENEATH which we need to handle absolute
     // symlinks.
     layer_root: rustix::fd::OwnedFd,
-    // Statistics
-    stats: &'r mut ImportLayerStats,
+}
+
+impl ImportContext {
+    fn import(&mut self, src: File) -> Result<ImportLayerStats> {
+        let mut stats = ImportLayerStats::default();
+        let src = std::io::BufReader::new(src);
+        let mut archive = tar::Archive::new(src);
+
+        for entry in archive.entries()? {
+            let entry = entry?;
+
+            let etype = entry.header().entry_type();
+            // Make a copy because it may refer into the header, but we need it
+            // after we process the entry too.
+            let path = entry.header().path()?;
+            if let Some(parent) = fileutils::parent_nonempty(&path) {
+                fileutils::ensure_dir_recursive(self.layer_root.as_fd(), parent, true)
+                    .with_context(|| format!("Creating parents for {path:?}"))?;
+            };
+
+            match etype {
+                tar::EntryType::Regular => {
+                    // Copy as we need to refer to it after processing the entry
+                    let path = path.into_owned();
+                    self.unpack_regfile(entry, &path, &mut stats)?;
+                }
+                tar::EntryType::Link => {
+                    let target = entry
+                        .link_name()
+                        .context("linkname")?
+                        .ok_or_else(|| anyhow::anyhow!("Missing hardlink target"))?;
+                    rustix::fs::linkat(
+                        self.layer_root.as_fd(),
+                        &*path,
+                        self.layer_root.as_fd(),
+                        &*target,
+                        AtFlags::empty(),
+                    )
+                    .with_context(|| format!("hardlinking {path:?} to {target:?}"))?;
+                    stats.meta_count += 1;
+                }
+                tar::EntryType::Symlink => {
+                    let target = entry
+                        .link_name()
+                        .context("linkname")?
+                        .ok_or_else(|| anyhow::anyhow!("Missing hardlink target"))?;
+                    rustix::fs::symlinkat(&*target, self.layer_root.as_fd(), &*path)
+                        .with_context(|| format!("symlinking {path:?} to {target:?}"))?;
+                    stats.meta_count += 1;
+                }
+                tar::EntryType::Char | tar::EntryType::Block => {
+                    todo!()
+                }
+                tar::EntryType::Directory => {
+                    fileutils::ensure_dir(self.layer_root.as_fd(), &path)?;
+                }
+                tar::EntryType::Fifo => todo!(),
+                o => anyhow::bail!("Unhandled entry type: {o:?}"),
+            }
+        }
+        Ok(stats)
+    }
+
+    async fn commit_objects_in(&self, prefix: &str) -> Result<()> {
+        let src = Arc::new(self.tmp_objects.open_dir(prefix)?);
+        let dest = Arc::new(self.global_objects.open_dir(prefix)?);
+        let mut tasks = tokio::task::JoinSet::new();
+        for ent in src.entries()? {
+            let ent = ent?;
+            let name = ent.file_name();
+            let src = Arc::clone(&src);
+            let dest = Arc::clone(&dest);
+            tasks.spawn_blocking(move || match dest.rename(&name, &src, &name) {
+                Ok(()) => Ok(()),
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::AlreadyExists) => Ok(()),
+                Err(e) => Err(e),
+            });
+        }
+        while let Some(r) = tasks.join_next().await {
+            r??;
+        }
+        Ok(())
+    }
+
+    #[context("Committing objects")]
+    async fn commit_tmpobjects(&self) -> Result<()> {
+        for d in self.tmp_objects.entries()? {
+            let d = d?;
+            if !d.file_type()?.is_dir() {
+                continue;
+            }
+            let name = d.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            self.commit_objects_in(name)
+                .await
+                .with_context(|| name.to_owned())?;
+        }
+        Ok(())
+    }
+
+    #[context("Unpacking regfile")]
+    fn unpack_regfile<E: std::io::Read>(
+        &mut self,
+        mut entry: tar::Entry<E>,
+        path: &Path,
+        stats: &mut ImportLayerStats,
+    ) -> Result<()> {
+        use rustix::fs::AtFlags;
+        // First, spool the file content to a temporary file
+        let mut tmpfile = TempFile::new(&self.tmp_objects).context("Creating tmpfile")?;
+        let wrote_size = std::io::copy(&mut entry, &mut tmpfile)
+            .with_context(|| format!("Copying tar entry {:?} to tmpfile", path))?;
+        tmpfile.seek(std::io::SeekFrom::Start(0))?;
+
+        // Load metadata
+        let header = entry.header();
+        let size = header.size().context("header size")?;
+        // This should always be true, but just in case
+        anyhow::ensure!(size == wrote_size);
+
+        // Compute its composefs digest.  This can be an expensive operation,
+        // so in the future it'd be nice to do this is a helper thread.  However
+        // doing so would significantly complicate the flow.
+        if self.has_verity {
+            fileutils::reopen_tmpfile_ro(&mut tmpfile).context("Reopening tmpfile")?;
+            composefs::fsverity::fsverity_enable(tmpfile.as_file().as_fd())
+                .context("Failed to enable fsverity")?;
+        };
+        let mut digest = Digest::new();
+        composefs::fsverity::fsverity_digest_from_fd(tmpfile.as_file().as_fd(), &mut digest)
+            .context("Computing fsverity digest")?;
+        let mut buf = hex::encode(digest.get());
+        buf.insert(2, '/');
+        let exists_globally = self.global_objects.try_exists(&buf)?;
+        let exists_locally = !exists_globally && self.tmp_objects.try_exists(&buf)?;
+        if exists_globally {
+            stats.extant_objects_count += 1;
+            stats.extant_objects_size += size;
+            rustix::fs::linkat(
+                self.tmp_objects.as_fd(),
+                &buf,
+                self.layer_root.as_fd(),
+                path,
+                AtFlags::empty(),
+            )
+            .with_context(|| format!("Linking extant object {buf} to {path:?}"))?;
+        } else {
+            if !exists_locally {
+                tmpfile.replace(&buf).context("tmpfile replace")?;
+                stats.imported_objects_count += 1;
+                stats.imported_objects_size += size;
+            }
+            rustix::fs::linkat(
+                self.tmp_objects.as_fd(),
+                &buf,
+                self.layer_root.as_fd(),
+                path,
+                AtFlags::empty(),
+            )
+            .with_context(|| format!("Linking tmp object {buf} to {path:?}"))?;
+        }
+
+        Ok(())
+    }
 }
 
 pub struct Repo {
@@ -208,7 +376,7 @@ impl Repo {
         self.fd.try_exists(layer_path).map_err(Into::into)
     }
 
-    pub fn import_layer(&self, src: &mut dyn BufRead, diffid: &str) -> Result<ImportLayerStats> {
+    pub async fn import_layer(&self, src: File, diffid: &str) -> Result<ImportLayerStats> {
         fileutils::validate_single_path_component(diffid).context("validating diffid")?;
         let layer_path = &format!("{LAYERS}/{diffid}");
         // If we've already fetched the layer, then assume the caller is forcing a re-import
@@ -218,18 +386,17 @@ impl Repo {
                 .remove_dir_all(layer_path)
                 .context("removing extant layerdir")?;
         }
-        let mut res = ImportLayerStats::default();
         let global_tmp = &self.fd.open_dir(TMP).context(TMP)?;
-        let global_objects = &self.fd.open_dir(OBJECTS).context(OBJECTS)?;
+        let global_objects = self.fd.open_dir(OBJECTS).context(OBJECTS)?;
         let (workdir, tmp_objects) = {
             let d = TempDir::new_in(global_tmp)?;
-            // rustix::fs::fsetxattr(
-            //     d.as_fd(),
-            //     BOOTID_XATTR,
-            //     self.bootid.as_bytes(),
-            //     rustix::fs::XattrFlags::empty(),
-            // )
-            // .context("setting bootid xattr")?;
+            fileutils::fsetxattr(
+                d.as_fd(),
+                BOOTID_XATTR,
+                self.bootid.as_bytes(),
+                rustix::fs::XattrFlags::empty(),
+            )
+            .context("setting bootid xattr")?;
             d.create_dir("root")?;
             d.create_dir(OBJECTS)?;
             let objects = d.open_dir(OBJECTS)?;
@@ -238,134 +405,22 @@ impl Repo {
         };
         let layer_root = fileutils::openat_rooted(workdir.as_fd(), "root")
             .context("Opening sandboxed layer dir")?;
-        let mut ctx = ImportContext {
-            workdir,
-            tmp_objects,
-            layer_root,
-            stats: &mut res,
-        };
-        let mut archive = tar::Archive::new(src);
 
-        for entry in archive.entries()? {
-            let entry = entry?;
-
-            let etype = entry.header().entry_type();
-            // Make a copy because it may refer into the header, but we need it
-            // after we process the entry too.
-            let path = entry.header().path()?;
-            if let Some(parent) = fileutils::parent_nonempty(&path) {
-                fileutils::ensure_dir_recursive(ctx.layer_root.as_fd(), parent, true)
-                    .with_context(|| format!("Creating parents for {path:?}"))?;
+        let has_verity = self.has_verity();
+        let (ctx, stats) = tokio::task::spawn_blocking(move || {
+            let mut ctx = ImportContext {
+                has_verity,
+                global_objects,
+                workdir,
+                tmp_objects,
+                layer_root,
             };
-
-            match etype {
-                tar::EntryType::Regular => {
-                    // Copy as we need to refer to it after processing the entry
-                    let path = path.into_owned();
-                    self.unpack_regfile(global_objects, &mut ctx, entry, &path)?;
-                }
-                tar::EntryType::Link => {
-                    let target = entry
-                        .link_name()
-                        .context("linkname")?
-                        .ok_or_else(|| anyhow::anyhow!("Missing hardlink target"))?;
-                    rustix::fs::linkat(
-                        ctx.layer_root.as_fd(),
-                        &*path,
-                        ctx.layer_root.as_fd(),
-                        &*target,
-                        AtFlags::empty(),
-                    )
-                    .with_context(|| format!("hardlinking {path:?} to {target:?}"))?;
-                    ctx.stats.meta_count += 1;
-                }
-                tar::EntryType::Symlink => {
-                    let target = entry
-                        .link_name()
-                        .context("linkname")?
-                        .ok_or_else(|| anyhow::anyhow!("Missing hardlink target"))?;
-                    rustix::fs::symlinkat(&*target, ctx.layer_root.as_fd(), &*path)
-                        .with_context(|| format!("symlinking {path:?} to {target:?}"))?;
-                    ctx.stats.meta_count += 1;
-                }
-                tar::EntryType::Char | tar::EntryType::Block => {
-                    todo!()
-                }
-                tar::EntryType::Directory => {
-                    fileutils::ensure_dir(ctx.layer_root.as_fd(), &path)?;
-                }
-                tar::EntryType::Fifo => todo!(),
-                o => anyhow::bail!("Unhandled entry type: {o:?}"),
-            }
-        }
-
-        Ok(res)
-    }
-
-    #[context("Unpacking regfile")]
-    fn unpack_regfile<E: std::io::Read>(
-        &self,
-        global_objects: &Dir,
-        ctx: &mut ImportContext,
-        mut entry: tar::Entry<E>,
-        path: &Path,
-    ) -> Result<()> {
-        use rustix::fs::AtFlags;
-        // First, spool the file content to a temporary file
-        let mut tmpfile = TempFile::new(&ctx.tmp_objects).context("Creating tmpfile")?;
-        let wrote_size = std::io::copy(&mut entry, &mut tmpfile)
-            .with_context(|| format!("Copying tar entry {:?} to tmpfile", path))?;
-        tmpfile.seek(std::io::SeekFrom::Start(0))?;
-
-        // Load metadata
-        let header = entry.header();
-        let size = header.size().context("header size")?;
-        // This should always be true, but just in case
-        anyhow::ensure!(size == wrote_size);
-
-        // Compute its composefs digest.  This can be an expensive operation,
-        // so in the future it'd be nice to do this is a helper thread.  However
-        // doing so would significantly complicate the flow.
-        if self.has_verity() {
-            fileutils::reopen_tmpfile_ro(&mut tmpfile).context("Reopening tmpfile")?;
-            composefs::fsverity::fsverity_enable(tmpfile.as_file().as_fd())
-                .context("Failed to enable fsverity")?;
-        };
-        let mut digest = Digest::new();
-        composefs::fsverity::fsverity_digest_from_fd(tmpfile.as_file().as_fd(), &mut digest)
-            .context("Computing fsverity digest")?;
-        let mut buf = hex::encode(digest.get());
-        buf.insert(2, '/');
-        let exists_globally = global_objects.try_exists(&buf)?;
-        let exists_locally = !exists_globally && ctx.tmp_objects.try_exists(&buf)?;
-        if exists_globally {
-            ctx.stats.extant_objects_count += 1;
-            ctx.stats.extant_objects_size += size;
-            rustix::fs::linkat(
-                ctx.tmp_objects.as_fd(),
-                &buf,
-                ctx.layer_root.as_fd(),
-                path,
-                AtFlags::empty(),
-            )
-            .with_context(|| format!("Linking extant object {buf} to {path:?}"))?;
-        } else {
-            if !exists_locally {
-                tmpfile.replace(&buf).context("tmpfile replace")?;
-                ctx.stats.imported_objects_count += 1;
-                ctx.stats.imported_objects_size += size;
-            }
-            rustix::fs::linkat(
-                ctx.tmp_objects.as_fd(),
-                &buf,
-                ctx.layer_root.as_fd(),
-                path,
-                AtFlags::empty(),
-            )
-            .with_context(|| format!("Linking tmp object {buf} to {path:?}"))?;
-        }
-
-        Ok(())
+            let stats = ctx.import(src)?;
+            anyhow::Ok((ctx, stats))
+        })
+        .await??;
+        ctx.commit_tmpobjects().await?;
+        Ok(stats)
     }
 }
 
@@ -394,8 +449,17 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn test_repo() -> Result<()> {
+    fn new_memfd(buf: &[u8]) -> Result<File> {
+        use rustix::fs::MemfdFlags;
+        let f = rustix::fs::memfd_create("test memfd", MemfdFlags::CLOEXEC)?;
+        let f = File::from(f);
+        let mut bufw = std::io::BufWriter::new(f);
+        std::io::copy(&mut std::io::Cursor::new(buf), &mut bufw)?;
+        bufw.into_inner().map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn test_repo() -> Result<()> {
         let td = TempDir::new(cap_std::ambient_authority())?;
         let td = &*td;
 
@@ -408,8 +472,10 @@ mod tests {
         assert!(!repo.has_layer(EMPTY_DIFFID).unwrap());
 
         // A no-op import
-        let mut buf = std::io::BufReader::new(std::io::Cursor::new(b""));
-        let r = repo.import_layer(&mut buf, EMPTY_DIFFID).unwrap();
+        let r = repo
+            .import_layer(new_memfd(b"")?, EMPTY_DIFFID)
+            .await
+            .unwrap();
         assert_eq!(r.extant_objects_count, 0);
         assert_eq!(r.imported_objects_count, 0);
         assert_eq!(r.imported_objects_size, 0);
@@ -430,9 +496,9 @@ mod tests {
         assert!(digest_o.status.success());
         let digest = String::from_utf8(digest_o.stdout).unwrap();
         let digest = digest.split_ascii_whitespace().next().unwrap().trim();
-        let mut testtar = td.open("test.tar").map(BufReader::new)?;
+        let testtar = td.open("test.tar")?;
 
-        repo.import_layer(&mut testtar, digest).unwrap();
+        repo.import_layer(testtar.into_std(), digest).await.unwrap();
 
         Ok(())
     }
