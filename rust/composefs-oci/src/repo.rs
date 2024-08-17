@@ -22,7 +22,9 @@ use composefs::dumpfile::{self, Entry};
 use composefs::fsverity::Digest;
 use composefs::mkcomposefs::{self, mkcomposefs};
 use fn_error_context::context;
-use ocidir::oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest};
+use ocidir::oci_spec::image::{
+    Descriptor, ImageConfiguration, ImageManifest, Platform, PlatformBuilder,
+};
 use ocidir::OciDir;
 use rustix::fd::{AsRawFd, BorrowedFd};
 use rustix::fs::{openat, AtFlags};
@@ -598,6 +600,11 @@ impl Repo {
             println!("Already stored: {manifest_digest}");
             return Ok(manifest_descriptor);
         }
+        let config = proxy.fetch_config(&img).await?;
+        let platform = PlatformBuilder::default()
+            .architecture(config.architecture().clone())
+            .os(config.os().clone())
+            .build()?;
 
         let manifest =
             ocidir::oci_spec::image::ImageManifest::from_reader(io::Cursor::new(&raw_manifest))?;
@@ -611,6 +618,7 @@ impl Repo {
                     }
                     Ok(acc)
                 })?;
+
         println!("Layers to fetch: {}", layers_to_fetch.len());
         for layer in layers_to_fetch {
             let size = layer.size().try_into().context("Invalid size")?;
@@ -632,10 +640,7 @@ impl Repo {
 
         let repo = self.clone();
         tokio::task::spawn_blocking(move || -> Result<_> {
-            let mut manifest_blob = repo.as_oci().create_blob()?;
-            manifest_blob.write_all(&raw_manifest)?;
-            manifest_blob.complete_verified_as(&manifest_descriptor)?;
-            Ok(manifest_descriptor)
+            repo.as_oci().insert_manifest(manifest, Some("default"), platform)
         })
         .await
         .unwrap()

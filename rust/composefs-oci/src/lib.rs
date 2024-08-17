@@ -14,6 +14,7 @@ mod digestsha256;
 mod fileutils;
 pub mod pull;
 pub mod repo;
+mod unpack;
 
 /// Options for specifying the repository
 #[derive(Debug, Parser)]
@@ -42,6 +43,16 @@ pub(crate) struct PullOpts {
     image: String,
 }
 
+/// Options for importing container.
+#[derive(Debug, Parser)]
+pub(crate) struct UnpackOpts {
+    #[clap(flatten)]
+    repo_opts: RepoOpts,
+
+    /// Image reference
+    image: String,
+}
+
 /// Options for creating a repo
 #[derive(Debug, Parser)]
 pub(crate) struct CreateOpts {
@@ -59,10 +70,11 @@ pub(crate) struct CreateOpts {
 #[clap(rename_all = "kebab-case")]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Opt {
-    /// Pull an image
+    /// Initialize a repo
     Create(CreateOpts),
     /// Pull an image
     Pull(PullOpts),
+    Unpack(UnpackOpts),
 }
 
 /// Parse the provided arguments and execute.
@@ -87,5 +99,7 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
             Ok(())
         }
         Opt::Pull(opts) => cli_pull(opts).await,
+        Opt::Unpack(opts) => unpack::cli_unpack(opts).await
+        
     }
 }
