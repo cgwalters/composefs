@@ -331,10 +331,6 @@ async fn merge_dir_to(from: Dir, to: Dir) -> Result<()> {
     Ok(())
 }
 
-async fn merge_dir_to_borrowed(from: &Dir, to: &Dir) -> Result<()> {
-    merge_dir_to(from.try_clone()?, to.try_clone()?).await
-}
-
 /// An opaque object representing an active transaction on the repository.
 #[derive(Debug)]
 pub struct RepoTransaction {
@@ -348,6 +344,8 @@ pub struct RepoTransaction {
 }
 
 impl RepoTransaction {
+    const TMPROOT: &'static str = "tmp/root";
+
     fn new(repo: &Repo) -> Result<Self> {
         let parent = Arc::clone(&repo.0);
         let global_tmp = &repo.0.dir.open_dir(TMP).context(TMP)?;
@@ -364,6 +362,7 @@ impl RepoTransaction {
         };
         let reuse_object_dirs = Arc::clone(&repo.0.reuse_object_dirs);
         let temp_repo = Repo::init_full(&workdir, repo.has_verity(), reuse_object_dirs)?;
+        workdir.create_dir(Self::TMPROOT).context(Self::TMPROOT)?;
         let r = RepoTransaction {
             parent,
             workdir,
@@ -377,11 +376,17 @@ impl RepoTransaction {
         TempFile::new(&self.repo.0.objects).map_err(Into::into)
     }
 
+    fn new_descriptor_with_bytes(&self, buf: &[u8]) -> Result<DescriptorWriter> {
+        let mut desc = DescriptorWriter::new(self.new_object()?)?;
+        desc.write_all(buf)?;
+        Ok(desc)
+    }
+
     fn import_tar(&self, src: File) -> Result<()> {
         let src = std::io::BufReader::new(src);
         let mut archive = tar::Archive::new(src);
 
-        let layer_root = fileutils::openat_rooted(self.workdir.as_fd(), "root")
+        let layer_root = fileutils::openat_rooted(self.workdir.as_fd(), Self::TMPROOT)
             .context("Opening sandboxed layer dir")?;
 
         for entry in archive.entries()? {
@@ -462,8 +467,11 @@ impl RepoTransaction {
 
     #[context("Importing object")]
     fn import_object(&self, mut tmpfile: TempFile) -> Result<Utf8PathBuf> {
-        let my_objects = &self.repo.0.objects;
+        // Rewind to ensure we read from the start
+        tmpfile.as_file_mut().seek(std::io::SeekFrom::Start(0))?;
+        // Gather state
         let size = tmpfile.as_file().metadata()?.size();
+        let my_objects = &self.repo.0.objects;
         // Compute its composefs digest.  This can be an expensive operation,
         // so in the future it'd be nice to do this is a helper thread.  However
         // doing so would significantly complicate the flow.
@@ -509,21 +517,21 @@ impl RepoTransaction {
         Ok(buf)
     }
 
-    fn import_object_and_by_sha256(
-        &self,
-        mut tmpfile: TempFile,
-        sha256: Sha256Hex,
-    ) -> Result<Utf8PathBuf> {
-        let objpath = self.import_object(tmpfile)?;
+    /// Import an object which also has a known descriptor. The descriptor will be validated (size and content-sha256),
+    /// and upon success a symlink will be added in objects/by-sha256 with the descriptor's content-sha256.
+    fn import_descriptor(&self, tmpf: DescriptorWriter, descriptor: &Descriptor) -> Result<()> {
+        let descriptor_sha256 = descriptor.sha256()?;
+        let tmpf = tmpf.finish_validate(&descriptor)?;
+        let mut objpath = self.import_object(tmpf)?.into_string();
+        objpath.insert_str(0, "../");
         let mut by_sha256_path = String::from(OBJECTS_BY_SHA256);
-        append_object_path(&mut by_sha256_path, &sha256)?;
-        linkat_allow_exists(
-            &self.repo.0.objects,
+        append_object_path(&mut by_sha256_path, &descriptor_sha256)?;
+        ignore_rustix_eexist(rustix::fs::symlinkat(
             &objpath,
             &self.repo.0.dir,
             &by_sha256_path,
-        )?;
-        Ok(objpath)
+        ))?;
+        Ok(())
     }
 
     #[context("Unpacking regfile")]
@@ -534,7 +542,7 @@ impl RepoTransaction {
         path: &Path,
     ) -> Result<()> {
         // First, spool the file content to a temporary file
-        let mut tmpfile = TempFile::new(&self.workdir).context("Creating tmpfile")?;
+        let mut tmpfile = self.new_object()?;
         let wrote_size = std::io::copy(&mut entry, &mut tmpfile)
             .with_context(|| format!("Copying tar entry {:?} to tmpfile", path))?;
         tmpfile.seek(std::io::SeekFrom::Start(0))?;
@@ -558,18 +566,29 @@ impl RepoTransaction {
 
     // Commit this transaction, returning statistics
     async fn commit(self) -> Result<TransactionStats> {
-        let from_basedir =&self.repo.0.dir;
+        let from_basedir = &self.repo.0.dir;
         let to_basedir = &self.parent.dir;
         Self::commit_objects(&self.repo.0.objects, &self.parent.objects).await?;
         {
-            let from_by_sha256 = from_basedir.open_dir(OBJECTS_BY_SHA256)?;
-            let to_by_sha256 = from_basedir.open_dir(OBJECTS_BY_SHA256)?;
+            let from_by_sha256 = from_basedir
+                .open_dir(OBJECTS_BY_SHA256)
+                .context(OBJECTS_BY_SHA256)?;
+            let to_by_sha256 = from_basedir
+                .open_dir(OBJECTS_BY_SHA256)
+                .context(OBJECTS_BY_SHA256)?;
             Self::commit_objects(&from_by_sha256, &to_by_sha256).await?;
         }
-        {
-            let from_tags = from_basedir.open_dir(TAGS).context(TAGS)?;
-            let to_tags = to_basedir.open_dir(TAGS).context(TAGS)?;
-            merge_dir_to(from_tags, to_tags).await.context("Committing tags")?;
+        for name in [ARTIFACTS, IMAGES] {
+            let tags_name = format!("{name}/{TAGS}");
+            let from_tags = from_basedir
+                .open_dir(&tags_name)
+                .with_context(|| format!("Opening {tags_name}"))?;
+            let to_tags = to_basedir
+                .open_dir(&tags_name)
+                .with_context(|| format!("Opening {tags_name}"))?;
+            merge_dir_to(from_tags, to_tags)
+                .await
+                .context("Committing tags")?;
         }
         // SAFETY: This just propagates panics, which is OK
         Ok(self.stats.into_inner().unwrap())
@@ -631,10 +650,10 @@ impl Repo {
         // A special subdir for images/
         dir.ensure_dir_with(format!("{IMAGES}/{LAYERS}"), dirbuilder)
             .context("Creating layers dir")?;
-        // The overall object dir
-        dir.ensure_dir_with(OBJECTS, dirbuilder).context(OBJECTS)?;
-        {
-            let objects = dir.open_dir(OBJECTS)?;
+        // The overall object dir, and its child by-sha256
+        for name in [OBJECTS, OBJECTS_BY_SHA256] {
+            dir.ensure_dir_with(name, dirbuilder).context(name)?;
+            let objects = dir.open_dir(name)?;
             init_object_dir(&objects)?;
         }
 
@@ -759,15 +778,24 @@ impl Repo {
             println!("Already stored: {manifest_digest}");
             return Ok((txn, manifest_descriptor));
         }
-        let txn = Arc::new(txn);
-        let config = proxy.fetch_config(&img).await?;
-        // let platform = PlatformBuilder::default()
-        //     .architecture(config.architecture().clone())
-        //     .os(config.os().clone())
-        //     .build()?;
+
+        // Import the manifest
+        {
+            let tmpf = txn.new_descriptor_with_bytes(&raw_manifest)?;
+            txn.import_descriptor(tmpf, &manifest_descriptor)?;
+        }
 
         let manifest =
             ocidir::oci_spec::image::ImageManifest::from_reader(io::Cursor::new(&raw_manifest))?;
+        let txn = Arc::new(txn);
+        let config_raw = proxy.fetch_config_raw(&img).await?;
+        let config_descriptor = manifest.config();
+        // Import the config
+        {
+            let tmpf = txn.new_descriptor_with_bytes(&config_raw)?;
+            txn.import_descriptor(tmpf, &config_descriptor)?;
+        }
+
         let layers_to_fetch =
             manifest
                 .layers()
@@ -788,17 +816,17 @@ impl Repo {
             let layer = layer.clone();
             let txn = Arc::clone(&txn);
             let import_task = tokio::task::spawn_blocking(move || -> Result<_> {
-                let tmpf = txn.new_object()?;
-                let mut blobwriter = DescriptorWriter::new(tmpf)?;
-                let _n: u64 = std::io::copy(&mut sync_blob_reader, &mut blobwriter)?;
-                let tmpf = blobwriter.finish_validate(&layer)?;
-                txn.import_object_and_by_sha256(tmpf, layer.sha256()?)?;
+                let mut tmpf = DescriptorWriter::new(txn.new_object()?)?;
+                let _n: u64 = std::io::copy(&mut sync_blob_reader, &mut tmpf)?;
+                txn.import_descriptor(tmpf, &layer)?;
                 Ok(())
             });
             let (import_task, driver) = tokio::join!(import_task, driver);
             let _: () = driver?;
             let _: () = import_task.unwrap()?;
         }
+        // SAFETY: We joined all the threads
+        let txn = Arc::into_inner(txn).unwrap();
 
         // let repo = self.clone();
         // tokio::task::spawn_blocking(move || -> Result<_> {
@@ -806,7 +834,7 @@ impl Repo {
         // })
         // .await
         // .unwrap()
-        Ok((Arc::into_inner(txn).unwrap(), manifest_descriptor))
+        Ok((txn, manifest_descriptor))
     }
 
     /// Ensure that a downloaded OCI image is "expanded" (unpacked)
@@ -934,7 +962,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_repo() -> Result<()> {
+    async fn test_import_layer() -> Result<()> {
         let td = TempDir::new(cap_std::ambient_authority())?;
         let td = &*td;
 
