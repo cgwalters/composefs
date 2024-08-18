@@ -22,6 +22,7 @@ use composefs::dumpfile::{self, Entry};
 use composefs::fsverity::Digest;
 use composefs::mkcomposefs::{self, mkcomposefs};
 use fn_error_context::context;
+use ocidir::cap_std::fs::MetadataExt;
 use ocidir::oci_spec::image::{
     Descriptor, ImageConfiguration, ImageManifest, MediaType, Platform, PlatformBuilder,
 };
@@ -218,19 +219,19 @@ impl<'a> DescriptorWriter<'a> {
         })
     }
 
-    fn finish(mut self, dest: impl AsRef<Path>, media_type: MediaType) -> Result<Descriptor> {
+    fn finish(mut self, media_type: MediaType) -> Result<(Descriptor, TempFile<'a>)> {
         // SAFETY: Nothing else should have taken the target
         let tempfile = self.target.take().unwrap();
-        tempfile.replace(dest.as_ref())?;
         let sha256 = hex::encode(self.sha256hasher.finish()?);
-        Ok(Descriptor::new(
+        let desc = Descriptor::new(
             media_type,
             self.size.try_into().unwrap(),
             format!("sha256:{sha256}"),
-        ))
+        );
+        Ok((desc, tempfile))
     }
 
-    fn finish_validate(mut self, dest: impl AsRef<Path>, descriptor: &Descriptor) -> Result<()> {
+    fn finish_validate(mut self, descriptor: &Descriptor) -> Result<TempFile<'a>> {
         let descriptor_size: u64 = descriptor.size().try_into()?;
         if descriptor_size != self.size {
             anyhow::bail!(
@@ -245,10 +246,8 @@ impl<'a> DescriptorWriter<'a> {
                 "Corrupted object, expected sha256:{expected_sha256} got sha256:{found_sha256}"
             );
         }
-        // SAFETY: Nothing else should have taken the target
-        let tempfile = self.target.take().unwrap();
-        tempfile.replace(dest.as_ref())?;
-        Ok(())
+        // SAFETY: Nothing else should have taken this value
+        Ok(self.target.take().unwrap())
     }
 }
 
@@ -313,7 +312,7 @@ fn linkat_allow_exists(
     }
 }
 
-struct ImportContext {
+struct RepoTransaction {
     has_verity: bool,
     /// Reference to global objects
     global_objects: Dir,
@@ -324,22 +323,48 @@ struct ImportContext {
     workdir: TempDir,
     // Handle for objects/ above
     tmp_objects: Dir,
-    // This fd is using openat2 for more complete sandboxing, unlike default
-    // cap-std which doesn't use RESOLVE_BENEATH which we need to handle absolute
-    // symlinks.
-    layer_root: rustix::fd::OwnedFd,
     reuse_object_dirs: Arc<Mutex<Vec<Dir>>>,
 }
 
-impl ImportContext {
-    fn import_descriptor(&self, obj: DescriptorWriter) -> Result<()> {
-        todo!()
+impl RepoTransaction {
+    fn new(repo: &Repo) -> Result<Self> {
+        let global_tmp = &repo.0.dir.open_dir(TMP).context(TMP)?;
+        let global_objects = repo.get_object_dir()?;
+        let (workdir, tmp_objects) = {
+            let d = TempDir::new_in(global_tmp)?;
+            fileutils::fsetxattr(
+                d.as_fd(),
+                BOOTID_XATTR,
+                repo.0.bootid.as_bytes(),
+                rustix::fs::XattrFlags::empty(),
+            )
+            .context("setting bootid xattr")?;
+            d.create_dir("root")?;
+            d.create_dir(OBJECTS)?;
+            let objects = d.open_dir(OBJECTS)?;
+            init_object_dir(&objects)?;
+            (d, objects)
+        };
+
+        let has_verity = repo.has_verity();
+        let reuse_object_dirs = Arc::clone(&repo.0.reuse_object_dirs);
+        let r = RepoTransaction {
+            has_verity,
+            global_objects,
+            workdir,
+            tmp_objects,
+            reuse_object_dirs,
+        };
+        Ok(r)
     }
 
     fn import_tar(&self, src: File) -> Result<ImportLayerStats> {
         let mut stats = ImportLayerStats::default();
         let src = std::io::BufReader::new(src);
         let mut archive = tar::Archive::new(src);
+
+        let layer_root = fileutils::openat_rooted(self.workdir.as_fd(), "root")
+        .context("Opening sandboxed layer dir")?;
 
         for entry in archive.entries()? {
             let entry = entry?;
@@ -349,7 +374,7 @@ impl ImportContext {
             // after we process the entry too.
             let path = entry.header().path()?;
             if let Some(parent) = fileutils::parent_nonempty(&path) {
-                fileutils::ensure_dir_recursive(self.layer_root.as_fd(), parent, true)
+                fileutils::ensure_dir_recursive(layer_root.as_fd(), parent, true)
                     .with_context(|| format!("Creating parents for {path:?}"))?;
             };
 
@@ -357,7 +382,7 @@ impl ImportContext {
                 tar::EntryType::Regular => {
                     // Copy as we need to refer to it after processing the entry
                     let path = path.into_owned();
-                    self.unpack_regfile(entry, &path, &mut stats)?;
+                    self.unpack_regfile(entry, layer_root.as_fd(),&path, &mut stats)?;
                 }
                 tar::EntryType::Link => {
                     let target = entry
@@ -365,9 +390,9 @@ impl ImportContext {
                         .context("linkname")?
                         .ok_or_else(|| anyhow::anyhow!("Missing hardlink target"))?;
                     rustix::fs::linkat(
-                        self.layer_root.as_fd(),
+                        layer_root.as_fd(),
                         &*path,
-                        self.layer_root.as_fd(),
+                        layer_root.as_fd(),
                         &*target,
                         AtFlags::empty(),
                     )
@@ -379,7 +404,7 @@ impl ImportContext {
                         .link_name()
                         .context("linkname")?
                         .ok_or_else(|| anyhow::anyhow!("Missing hardlink target"))?;
-                    rustix::fs::symlinkat(&*target, self.layer_root.as_fd(), &*path)
+                    rustix::fs::symlinkat(&*target, layer_root.as_fd(), &*path)
                         .with_context(|| format!("symlinking {path:?} to {target:?}"))?;
                     stats.meta_count += 1;
                 }
@@ -387,7 +412,7 @@ impl ImportContext {
                     todo!()
                 }
                 tar::EntryType::Directory => {
-                    fileutils::ensure_dir(self.layer_root.as_fd(), &path)?;
+                    fileutils::ensure_dir(layer_root.as_fd(), &path)?;
                 }
                 tar::EntryType::Fifo => todo!(),
                 o => anyhow::bail!("Unhandled entry type: {o:?}"),
@@ -443,26 +468,8 @@ impl ImportContext {
         Ok(())
     }
 
-    #[context("Unpacking regfile")]
-    fn unpack_regfile<E: std::io::Read>(
-        &self,
-        mut entry: tar::Entry<E>,
-        path: &Path,
-        stats: &mut ImportLayerStats,
-    ) -> Result<()> {
-        use rustix::fs::AtFlags;
-        // First, spool the file content to a temporary file
-        let mut tmpfile = TempFile::new(&self.tmp_objects).context("Creating tmpfile")?;
-        let wrote_size = std::io::copy(&mut entry, &mut tmpfile)
-            .with_context(|| format!("Copying tar entry {:?} to tmpfile", path))?;
-        tmpfile.seek(std::io::SeekFrom::Start(0))?;
-
-        // Load metadata
-        let header = entry.header();
-        let size = header.size().context("header size")?;
-        // This should always be true, but just in case
-        anyhow::ensure!(size == wrote_size);
-
+    fn import_object(&self, mut tmpfile: TempFile, dest: BorrowedFd, path: &Path, stats: &mut ImportLayerStats) -> Result<()> {
+        let size = tmpfile.as_file().metadata()?.size();
         // Compute its composefs digest.  This can be an expensive operation,
         // so in the future it'd be nice to do this is a helper thread.  However
         // doing so would significantly complicate the flow.
@@ -494,7 +501,7 @@ impl ImportContext {
             rustix::fs::linkat(
                 &self.global_objects.as_fd(),
                 &buf,
-                self.layer_root.as_fd(),
+                dest,
                 path,
                 AtFlags::empty(),
             )
@@ -508,14 +515,36 @@ impl ImportContext {
             rustix::fs::linkat(
                 self.tmp_objects.as_fd(),
                 &buf,
-                self.layer_root.as_fd(),
+                dest,
                 path,
                 AtFlags::empty(),
             )
             .with_context(|| format!("Linking tmp object {buf} to {path:?}"))?;
         }
-
         Ok(())
+    }
+
+    #[context("Unpacking regfile")]
+    fn unpack_regfile<E: std::io::Read>(
+        &self,
+        mut entry: tar::Entry<E>,
+        layer_root: BorrowedFd,
+        path: &Path,
+        stats: &mut ImportLayerStats,
+    ) -> Result<()> {
+        // First, spool the file content to a temporary file
+        let mut tmpfile = TempFile::new(&self.tmp_objects).context("Creating tmpfile")?;
+        let wrote_size = std::io::copy(&mut entry, &mut tmpfile)
+            .with_context(|| format!("Copying tar entry {:?} to tmpfile", path))?;
+        tmpfile.seek(std::io::SeekFrom::Start(0))?;
+
+        // Load metadata
+        let header = entry.header();
+        let size = header.size().context("header size")?;
+        // This should always be true, but just in case
+        anyhow::ensure!(size == wrote_size);
+
+        self.import_object(tmpfile, layer_root, path, stats)
     }
 }
 
@@ -652,42 +681,13 @@ impl Repo {
                 .remove_dir_all(&layer_path)
                 .context("removing extant layerdir")?;
         }
-        let global_tmp = &self.0.dir.open_dir(TMP).context(TMP)?;
-        let global_objects = self.get_object_dir()?;
-        let (workdir, tmp_objects) = {
-            let d = TempDir::new_in(global_tmp)?;
-            fileutils::fsetxattr(
-                d.as_fd(),
-                BOOTID_XATTR,
-                self.0.bootid.as_bytes(),
-                rustix::fs::XattrFlags::empty(),
-            )
-            .context("setting bootid xattr")?;
-            d.create_dir("root")?;
-            d.create_dir(OBJECTS)?;
-            let objects = d.open_dir(OBJECTS)?;
-            init_object_dir(&objects)?;
-            (d, objects)
-        };
-        let layer_root = fileutils::openat_rooted(workdir.as_fd(), "root")
-            .context("Opening sandboxed layer dir")?;
-
-        let has_verity = self.has_verity();
-        let reuse_object_dirs = Arc::clone(&self.0.reuse_object_dirs);
-        let (ctx, stats) = tokio::task::spawn_blocking(move || {
-            let mut ctx = ImportContext {
-                has_verity,
-                global_objects,
-                workdir,
-                tmp_objects,
-                layer_root,
-                reuse_object_dirs,
-            };
-            let stats = ctx.import_tar(src)?;
-            anyhow::Ok((ctx, stats))
+        let tx = RepoTransaction::new(&self)?;
+        let (tx, stats) = tokio::task::spawn_blocking(move || {
+            let stats = tx.import_tar(src)?;
+            anyhow::Ok((tx, stats))
         })
         .await??;
-        ctx.commit_tmpobjects().await?;
+        tx.commit_tmpobjects().await?;
         Ok(stats)
     }
 
@@ -698,6 +698,7 @@ impl Repo {
         imgref: &str,
     ) -> Result<Descriptor> {
         let img = proxy.open_image(&imgref).await?;
+        let tx = RepoTransaction::new(&self)?;
         let (manifest_digest, raw_manifest) = proxy.fetch_manifest_raw_oci(&img).await?;
         let manifest_descriptor = Descriptor::new(
             ocidir::oci_spec::image::MediaType::ImageManifest,
@@ -710,10 +711,10 @@ impl Repo {
             return Ok(manifest_descriptor.into());
         }
         let config = proxy.fetch_config(&img).await?;
-        let platform = PlatformBuilder::default()
-            .architecture(config.architecture().clone())
-            .os(config.os().clone())
-            .build()?;
+        // let platform = PlatformBuilder::default()
+        //     .architecture(config.architecture().clone())
+        //     .os(config.os().clone())
+        //     .build()?;
 
         let manifest =
             ocidir::oci_spec::image::ImageManifest::from_reader(io::Cursor::new(&raw_manifest))?;
@@ -739,8 +740,9 @@ impl Repo {
             let import_task = tokio::task::spawn_blocking(move || -> Result<_> {
                 let mut blobwriter = DescriptorWriter::new(&repo.0.dir)?;
                 let _n: u64 = std::io::copy(&mut sync_blob_reader, &mut blobwriter)?;
-                todo!();
-                //                blobwriter.finish_validate(&layer)?;
+                let tmpf = blobwriter.finish_validate(&layer)?;
+                let mut objpath = String::from(OBJECTS_BY_SHA256);
+                append_object_path(&mut objpath, &layer.sha256()?)?;
                 Ok(layer)
             });
             let (import_task, driver) = tokio::join!(import_task, driver);
