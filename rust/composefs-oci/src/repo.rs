@@ -378,8 +378,8 @@ impl RepoTransaction {
                         AtFlags::empty(),
                     )
                     .with_context(|| format!("hardlinking {path:?} to {target:?}"))?;
-                let mut stats = self.stats.lock().unwrap();
-                stats.meta_count += 1;
+                    let mut stats = self.stats.lock().unwrap();
+                    stats.meta_count += 1;
                 }
                 tar::EntryType::Symlink => {
                     let target = entry
@@ -450,10 +450,7 @@ impl RepoTransaction {
     }
 
     #[context("Importing object")]
-    fn import_object(
-        &self,
-        mut tmpfile: TempFile,
-    ) -> Result<Utf8PathBuf> {
+    fn import_object(&self, mut tmpfile: TempFile) -> Result<Utf8PathBuf> {
         let my_objects = &self.repo.0.objects;
         let size = tmpfile.as_file().metadata()?.size();
         // Compute its composefs digest.  This can be an expensive operation,
@@ -488,13 +485,8 @@ impl RepoTransaction {
             let mut stats = self.stats.lock().unwrap();
             stats.extant_objects_count += 1;
             stats.extant_objects_size += size;
-            linkat_allow_exists(
-                &self.global_objects.as_fd(),
-                objpath,
-                &my_objects,
-                objpath,
-            )
-            .with_context(|| format!("Linking extant object {buf}"))?;
+            linkat_allow_exists(&self.global_objects.as_fd(), objpath, &my_objects, objpath)
+                .with_context(|| format!("Linking extant object {buf}"))?;
         } else {
             if !exists_locally {
                 ignore_std_eexist(tmpfile.replace(&buf)).context("tmpfile replace")?;
@@ -526,7 +518,13 @@ impl RepoTransaction {
         anyhow::ensure!(size == wrote_size);
 
         let objpath = self.import_object(tmpfile)?;
-        rustix::fs::linkat(&self.repo.0.objects, objpath.as_std_path(), layer_root, path, AtFlags::empty())?;
+        rustix::fs::linkat(
+            &self.repo.0.objects,
+            objpath.as_std_path(),
+            layer_root,
+            path,
+            AtFlags::empty(),
+        )?;
         Ok(())
     }
 
@@ -534,7 +532,6 @@ impl RepoTransaction {
     async fn commit(self) -> Result<TransactionStats> {
         Self::commit_objects(&self.repo.0.objects, &self.global_objects).await?;
         Ok(Arc::into_inner(self.stats).unwrap().into_inner().unwrap())
-
     }
 }
 
@@ -671,7 +668,12 @@ impl Repo {
     }
 
     #[context("Importing layer")]
-    pub async fn import_layer(&self, txn: RepoTransaction, src: File, diffid: &str) -> Result<RepoTransaction> {
+    pub async fn import_layer(
+        &self,
+        txn: RepoTransaction,
+        src: File,
+        diffid: &str,
+    ) -> Result<RepoTransaction> {
         let mut layer_path = format!("{IMAGES}/{LAYERS}");
         append_object_path(&mut layer_path, diffid)?;
         // If we've already fetched the layer, then assume the caller is forcing a re-import
@@ -683,7 +685,12 @@ impl Repo {
                 .context("removing extant layerdir")?;
         }
         // SAFETY: Panic if we can't join the thread
-        tokio::task::spawn_blocking(move || { txn.import_tar(src)?; Ok(txn) }).await.unwrap()
+        tokio::task::spawn_blocking(move || {
+            txn.import_tar(src)?;
+            Ok(txn)
+        })
+        .await
+        .unwrap()
     }
 
     /// Pull the target artifact
@@ -917,7 +924,10 @@ mod tests {
         let testtar = td.open("test.tar")?;
 
         let txn = repo.new_transaction()?;
-        let txn = repo.import_layer(txn, testtar.into_std(), digest).await.unwrap();
+        let txn = repo
+            .import_layer(txn, testtar.into_std(), digest)
+            .await
+            .unwrap();
         txn.commit().await.unwrap();
 
         Ok(())

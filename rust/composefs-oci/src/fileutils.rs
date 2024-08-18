@@ -9,9 +9,7 @@ use cap_std_ext::{
     },
     cap_tempfile::TempFile,
 };
-use rustix::{
-    fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
-};
+use rustix::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 /// The default permissions set for directories; we assume
 /// nothing else should be accessing this content.  If you want
