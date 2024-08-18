@@ -14,6 +14,7 @@ mod digestsha256;
 mod fileutils;
 pub mod pull;
 pub mod repo;
+mod sha256descriptor;
 mod unpack;
 
 /// Options for specifying the repository
@@ -99,7 +100,6 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
             Ok(())
         }
         Opt::Pull(opts) => cli_pull(opts).await,
-        Opt::Unpack(opts) => unpack::cli_unpack(opts).await
-        
+        Opt::Unpack(opts) => unpack::cli_unpack(opts).await,
     }
 }

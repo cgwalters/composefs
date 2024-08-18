@@ -55,17 +55,22 @@ object.
 
 ### Layout
 
-A cfs-ocidir has the following toplevel directories:
+A cfs-ocidir has the following toplevel entries:
 
+- `meta.json`: Metadata
 - `images/`: A directory for OCI images (not generic artifacts) filled with composefs files (backed by `objects/`), named by their fsverity digest (split-checksum)
 - `images/tags/`: A directory of hard links to `images/`, with the file name being a URL encoding of the image name
+- `images/by-manifest-digest/`: A directory of hardlinks to `images/`, named by the sha256 digest of the manifest (split-checksum)
 - `images/layers/`: A directory filled with composefs files (backed by `objects/`), named by their "diffid" (sha256) (split-checksum)
    Each composefs file has a set of xattrs `user.composefs.blobid.0..n` where each value is the sha256 digest
    of a corresponding compressed tar stream.
 - `artifacts/`: A directory for OCI artifacts, filled with composefs files, named by their fsverity digest (split-checksum)
 - `artifacts/tags`: A directory with hard links to `artifacts/`, with the file name being a URL encoding of the artifact name
+- `artifacts/by-manifest/`: A directory of hardlinks to `artifacts/`, same as `images/by-manifest-digest` otherwise
 - `objects/`: A "split-checksum" object directory, used as the shared backing store for all composefs
   files.
+- `objects/by-sha256`: A split-checksum directory with hardlinks to objects named by sha256 (optional, not all objects have their
+  plain sha256 calculated)
 
 Note that an artifact may *also* be an OCI image; it is not required to store OCI images "unpacked".
 

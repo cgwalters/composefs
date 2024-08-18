@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::borrow::{Borrow, Cow};
 use std::cell::OnceCell;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Seek, Write};
@@ -13,38 +13,40 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::{Context, Result};
 use camino::Utf8Path;
 use cap_std::fs::Dir;
-use cap_std_ext::cap_std;
 use cap_std_ext::cap_std::fs::{DirBuilder, DirBuilderExt, PermissionsExt};
 use cap_std_ext::cap_tempfile::{TempDir, TempFile};
 use cap_std_ext::cmdext::CapStdExtCommandExt;
 use cap_std_ext::dirext::CapStdExtDirExt;
+use cap_std_ext::{cap_std, cap_tempfile};
 use composefs::dumpfile::{self, Entry};
 use composefs::fsverity::Digest;
 use composefs::mkcomposefs::{self, mkcomposefs};
 use fn_error_context::context;
 use ocidir::oci_spec::image::{
-    Descriptor, ImageConfiguration, ImageManifest, Platform, PlatformBuilder,
+    Descriptor, ImageConfiguration, ImageManifest, MediaType, Platform, PlatformBuilder,
 };
 use ocidir::OciDir;
+use openssl::hash::{Hasher, MessageDigest};
 use rustix::fd::{AsRawFd, BorrowedFd};
 use rustix::fs::{openat, AtFlags};
 use serde::{Deserialize, Serialize};
 
 use crate::digestsha256::DigestSha256;
 use crate::fileutils;
-
-/// The subdirectory of the OCI image layout we use; everything
-/// else below is relative to this.
-const CFSDIR: &str = "cfs";
+use crate::sha256descriptor::DescriptorExt;
 
 /// Standardized metadata
 const REPOMETA: &str = "meta.json";
 /// A composefs/ostree style object directory
 const OBJECTS: &str = "objects";
+/// A split-checksum hardlink set into OBJECTS
+const OBJECTS_BY_SHA256: &str = "objects/by-sha256";
 /// OCI container images, stored in a ready-to-run format
 const IMAGES: &str = "images";
-/// A subdirectory of images/ or artifacts/
+/// A subdirectory of images/ or artifacts/, hardlink farm
 const TAGS: &str = "tags";
+/// Object hardlink farm, by manifest sha256 digest
+const BY_MANIFEST: &str = "by-manifest-digest";
 /// A subdirectory of images/
 const LAYERS: &str = "layers";
 /// Generic OCI artifacts (may be container images)
@@ -171,6 +173,85 @@ fn create_entry(h: tar::Header) -> Result<Entry<'static>> {
 //     Ok(())
 // }
 
+/// A writer which writes an object identified by sha256.
+pub struct DescriptorWriter<'a> {
+    /// Compute checksum
+    sha256hasher: Hasher,
+    /// Target file
+    target: Option<cap_tempfile::TempFile<'a>>,
+    size: u64,
+}
+
+impl<'a> std::fmt::Debug for DescriptorWriter<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DescriptorWRiter")
+            .field("target", &self.target)
+            .field("size", &self.size)
+            .finish()
+    }
+}
+
+impl<'a> std::io::Write for DescriptorWriter<'a> {
+    fn write(&mut self, srcbuf: &[u8]) -> std::io::Result<usize> {
+        self.sha256hasher.update(srcbuf)?;
+        self.target
+            .as_mut()
+            .unwrap()
+            .as_file_mut()
+            .write_all(srcbuf)?;
+        self.size += srcbuf.len() as u64;
+        Ok(srcbuf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> DescriptorWriter<'a> {
+    fn new(dir: &'a Dir) -> Result<Self> {
+        Ok(Self {
+            sha256hasher: Hasher::new(MessageDigest::sha256())?,
+            // FIXME add ability to choose filename after completion
+            target: Some(cap_tempfile::TempFile::new(dir)?),
+            size: 0,
+        })
+    }
+
+    fn finish(mut self, dest: impl AsRef<Path>, media_type: MediaType) -> Result<Descriptor> {
+        // SAFETY: Nothing else should have taken the target
+        let tempfile = self.target.take().unwrap();
+        tempfile.replace(dest.as_ref())?;
+        let sha256 = hex::encode(self.sha256hasher.finish()?);
+        Ok(Descriptor::new(
+            media_type,
+            self.size.try_into().unwrap(),
+            format!("sha256:{sha256}"),
+        ))
+    }
+
+    fn finish_validate(mut self, dest: impl AsRef<Path>, descriptor: &Descriptor) -> Result<()> {
+        let descriptor_size: u64 = descriptor.size().try_into()?;
+        if descriptor_size != self.size {
+            anyhow::bail!(
+                "Corrupted object, expected size {descriptor_size}, got size {}",
+                self.size
+            );
+        }
+        let found_sha256 = hex::encode(self.sha256hasher.finish()?);
+        let expected_sha256 = &*descriptor.sha256()?;
+        if found_sha256 != expected_sha256 {
+            anyhow::bail!(
+                "Corrupted object, expected sha256:{expected_sha256} got sha256:{found_sha256}"
+            );
+        }
+        // SAFETY: Nothing else should have taken the target
+        let tempfile = self.target.take().unwrap();
+        tempfile.replace(dest.as_ref())?;
+        Ok(())
+    }
+}
+
 #[context("Initializing object dir")]
 fn init_object_dir(objects: &Dir) -> Result<()> {
     for prefix in 0..=0xFFu8 {
@@ -251,7 +332,11 @@ struct ImportContext {
 }
 
 impl ImportContext {
-    fn import(&self, src: File) -> Result<ImportLayerStats> {
+    fn import_descriptor(&self, obj: DescriptorWriter) -> Result<()> {
+        todo!()
+    }
+
+    fn import_tar(&self, src: File) -> Result<ImportLayerStats> {
         let mut stats = ImportLayerStats::default();
         let src = std::io::BufReader::new(src);
         let mut archive = tar::Archive::new(src);
@@ -436,7 +521,7 @@ impl ImportContext {
 
 #[derive(Debug)]
 struct RepoInner {
-    oci: OciDir,
+    dir: Dir,
     bootid: &'static str,
     reuse_object_dirs: Arc<Mutex<Vec<Dir>>>,
     meta: RepoMetadata,
@@ -447,48 +532,53 @@ pub struct Repo(Arc<RepoInner>);
 
 impl Repo {
     #[context("Initializing repo")]
-    pub fn init(fd: &Dir, require_verity: bool) -> Result<Self> {
-        let oci = OciDir::ensure(fd)?;
-        let supports_verity = test_fsverity_in(&fd)?;
+    pub fn init(dir: &Dir, require_verity: bool) -> Result<Self> {
+        let supports_verity = test_fsverity_in(&dir)?;
         if require_verity && !supports_verity {
             anyhow::bail!("Requested fsverity, but target does not support it");
         }
         let dirbuilder = &fileutils::default_dirbuilder();
-        oci.dir
-            .ensure_dir_with(CFSDIR, dirbuilder)
-            .context(CFSDIR)?;
-        let cfsdir = &oci.dir.open_dir(CFSDIR)?;
         let meta = RepoMetadata {
             version: String::from("0.5"),
             verity: supports_verity,
         };
-        if !cfsdir.try_exists(REPOMETA)? {
-            cfsdir.atomic_replace_with(REPOMETA, |w| {
+        if !dir.try_exists(REPOMETA)? {
+            dir.atomic_replace_with(REPOMETA, |w| {
                 serde_json::to_writer(w, &meta).map_err(anyhow::Error::msg)
             })?;
         }
-        // Object directories
-        for d in [OBJECTS, LAYERS, IMAGES] {
-            cfsdir.ensure_dir_with(d, dirbuilder).context(d)?;
-            let objects = cfsdir.open_dir(d)?;
+        // Images and artifacts
+        for name in [ARTIFACTS, IMAGES] {
+            dir.ensure_dir_with(name, dirbuilder).context(name)?;
+            dir.ensure_dir_with(format!("{name}/{TAGS}"), dirbuilder)
+                .context(TAGS)?;
+            dir.ensure_dir_with(format!("{name}/{BY_MANIFEST}"), dirbuilder)
+                .context(BY_MANIFEST)?;
+        }
+        // A special subdir for images/
+        dir.ensure_dir_with(format!("{IMAGES}/{LAYERS}"), dirbuilder)
+            .context("Creating layers dir")?;
+        // The overall object dir
+        dir.ensure_dir_with(OBJECTS, dirbuilder).context(OBJECTS)?;
+        {
+            let objects = dir.open_dir(OBJECTS)?;
             init_object_dir(&objects)?;
         }
-        cfsdir.ensure_dir_with(TMP, dirbuilder)?;
-        Self::impl_open(oci)
+
+        dir.ensure_dir_with(TMP, dirbuilder)?;
+        Self::impl_open(dir.try_clone()?)
     }
 
-    fn impl_open(oci: OciDir) -> Result<Self> {
+    fn impl_open(dir: Dir) -> Result<Self> {
         let bootid = get_bootid();
-        let metapath = format!("{CFSDIR}/{REPOMETA}");
         let meta = serde_json::from_reader(
-            oci.dir
-                .open(&metapath)
+            dir.open(REPOMETA)
                 .map(std::io::BufReader::new)
-                .with_context(|| format!("Opening {metapath}"))?,
+                .with_context(|| format!("Opening {REPOMETA}"))?,
         )?;
         let reuse_object_dirs = Arc::new(Mutex::new(Vec::new()));
         let inner = Arc::new(RepoInner {
-            oci,
+            dir,
             bootid,
             meta,
             reuse_object_dirs,
@@ -497,9 +587,8 @@ impl Repo {
     }
 
     #[context("Opening composefs-oci repo")]
-    pub fn open(fd: Dir) -> Result<Self> {
-        let oci = ocidir::OciDir::open(&fd)?;
-        Self::impl_open(oci)
+    pub fn open(dir: Dir) -> Result<Self> {
+        Self::impl_open(dir)
     }
 
     /// Path to a directory with a composefs objects/ directory
@@ -515,42 +604,56 @@ impl Repo {
         Ok(())
     }
 
-    pub fn as_oci(&self) -> &ocidir::OciDir {
-        &self.0.oci
-    }
-
     pub fn has_verity(&self) -> bool {
         self.0.meta.verity
     }
 
     /// Returns true if this layer is stored in expanded form.
-    pub fn has_layer(&self, diffid: &str) -> Result<bool> {
-        let mut layer_path = String::from(CFSDIR);
+    fn has_layer(&self, diffid: &str) -> Result<bool> {
+        let mut layer_path = format!("{IMAGES}/{LAYERS}");
         append_object_path(&mut layer_path, diffid)?;
-        self.0.oci.dir.try_exists(layer_path).map_err(Into::into)
+        self.0.dir.try_exists(layer_path).map_err(Into::into)
     }
 
-    pub fn has_manifest(&self, diffid: &str) -> Result<bool> {
-        let mut layer_path = String::from(CFSDIR);
-        append_object_path(&mut layer_path, diffid)?;
-        self.0.oci.dir.try_exists(layer_path).map_err(Into::into)
+    /// Returns true if descriptor is stored as an object
+    fn has_descriptor_object(&self, descriptor: &Descriptor) -> Result<bool> {
+        let mut layer_path = String::from(OBJECTS_BY_SHA256);
+        append_object_path(&mut layer_path, &descriptor.sha256()?)?;
+        self.0.dir.try_exists(layer_path).map_err(Into::into)
+    }
+
+    /// Returns true if this manifest digest is stored as an image
+    pub fn has_image_manifest(&self, descriptor: &Descriptor) -> Result<bool> {
+        let mut path = format!("{IMAGES}/{BY_MANIFEST}");
+        append_object_path(&mut path, &descriptor.sha256()?)?;
+        self.0.dir.try_exists(path).map_err(Into::into)
+    }
+
+    /// Returns true if this manifest digest is stored as an artifact
+    pub fn has_artifact_manifest(&self, descriptor: &Descriptor) -> Result<bool> {
+        let mut path = format!("{ARTIFACTS}/{BY_MANIFEST}");
+        append_object_path(&mut path, &descriptor.sha256()?)?;
+        self.0.dir.try_exists(path).map_err(Into::into)
+    }
+
+    fn get_object_dir(&self) -> Result<Dir> {
+        self.0.dir.open_dir(OBJECTS).context(OBJECTS)
     }
 
     #[context("Importing layer")]
     pub async fn import_layer(&self, src: File, diffid: &str) -> Result<ImportLayerStats> {
-        fileutils::validate_single_path_component(diffid).context("validating diffid")?;
-        let cfsdir = self.0.oci.dir.open_dir(CFSDIR)?;
-        let mut layer_path = String::from(LAYERS);
+        let mut layer_path = format!("{IMAGES}/{LAYERS}");
         append_object_path(&mut layer_path, diffid)?;
         // If we've already fetched the layer, then assume the caller is forcing a re-import
         // to e.g. repair missing files.
-        if cfsdir.try_exists(&layer_path)? {
-            cfsdir
+        if self.0.dir.try_exists(&layer_path)? {
+            self.0
+                .dir
                 .remove_dir_all(&layer_path)
                 .context("removing extant layerdir")?;
         }
-        let global_tmp = &cfsdir.open_dir(TMP).context(TMP)?;
-        let global_objects = cfsdir.open_dir(OBJECTS).context(OBJECTS)?;
+        let global_tmp = &self.0.dir.open_dir(TMP).context(TMP)?;
+        let global_objects = self.get_object_dir()?;
         let (workdir, tmp_objects) = {
             let d = TempDir::new_in(global_tmp)?;
             fileutils::fsetxattr(
@@ -580,7 +683,7 @@ impl Repo {
                 layer_root,
                 reuse_object_dirs,
             };
-            let stats = ctx.import(src)?;
+            let stats = ctx.import_tar(src)?;
             anyhow::Ok((ctx, stats))
         })
         .await??;
@@ -588,8 +691,8 @@ impl Repo {
         Ok(stats)
     }
 
-    /// Pull the target image
-    pub async fn pull(
+    /// Pull the target artifact
+    pub async fn pull_artifact(
         &self,
         proxy: &containers_image_proxy::ImageProxy,
         imgref: &str,
@@ -602,9 +705,9 @@ impl Repo {
             &manifest_digest,
         );
 
-        if self.as_oci().has_manifest(&manifest_descriptor)? {
+        if self.has_artifact_manifest(&manifest_descriptor)? {
             println!("Already stored: {manifest_digest}");
-            return Ok(manifest_descriptor);
+            return Ok(manifest_descriptor.into());
         }
         let config = proxy.fetch_config(&img).await?;
         let platform = PlatformBuilder::default()
@@ -619,7 +722,7 @@ impl Repo {
                 .layers()
                 .iter()
                 .try_fold(Vec::new(), |mut acc, layer| -> Result<_> {
-                    if !self.as_oci().has_blob(layer)? {
+                    if !self.has_descriptor_object(layer)? {
                         acc.push(layer);
                     }
                     Ok(acc)
@@ -634,9 +737,10 @@ impl Repo {
             let repo = self.clone();
             let layer = layer.clone();
             let import_task = tokio::task::spawn_blocking(move || -> Result<_> {
-                let mut blobwriter = repo.as_oci().create_blob()?;
+                let mut blobwriter = DescriptorWriter::new(&repo.0.dir)?;
                 let _n: u64 = std::io::copy(&mut sync_blob_reader, &mut blobwriter)?;
-                let _blob = blobwriter.complete_verified_as(&layer)?;
+                todo!();
+                //                blobwriter.finish_validate(&layer)?;
                 Ok(layer)
             });
             let (import_task, driver) = tokio::join!(import_task, driver);
@@ -644,76 +748,78 @@ impl Repo {
             let _: Descriptor = import_task.unwrap()?;
         }
 
-        let repo = self.clone();
-        tokio::task::spawn_blocking(move || -> Result<_> {
-            repo.as_oci().insert_manifest(manifest, Some("default"), platform)
-        })
-        .await
-        .unwrap()
+        // let repo = self.clone();
+        // tokio::task::spawn_blocking(move || -> Result<_> {
+        //     repo.as_oci().insert_manifest(manifest, Some("default"), platform)
+        // })
+        // .await
+        // .unwrap()
+        Ok(manifest_descriptor)
     }
 
     /// Ensure that a downloaded OCI image is "expanded" (unpacked)
     /// into the composefs-native store.
     pub async fn expand(&self, manifest_desc: &Descriptor) -> Result<ImportLayerStats> {
-        let repo = self.clone();
-        let manifest_desc = manifest_desc.clone();
-        // Read and parse the manifest in a helper thread, also retaining its fd
-        let (manifest_fd, manifest) = tokio::task::spawn_blocking(move || -> Result<_> {
-            let mut bufr = repo
-                .as_oci()
-                .read_blob(&manifest_desc)
-                .map(BufReader::new)?;
-            let parsed = serde_json::from_reader::<_, ImageManifest>(&mut bufr)?;
-            let mut f = bufr.into_inner();
-            f.seek(std::io::SeekFrom::Start(0))?;
-            Ok((f, parsed))
-        })
-        .await
-        .unwrap()
-        .context("Reading manifest")?;
-        // Read and parse the config in a helper thread
-        let repo = self.clone();
-        let config = manifest.config().clone();
-        let config: ImageConfiguration = tokio::task::spawn_blocking(move || -> Result<_> {
-            repo.as_oci().read_json_blob(&config)
-        })
-        .await
-        .unwrap()?;
+        todo!()
+        // let repo = self.clone();
+        // let manifest_desc = manifest_desc.clone();
+        // // Read and parse the manifest in a helper thread, also retaining its fd
+        // let (manifest_fd, manifest) = tokio::task::spawn_blocking(move || -> Result<_> {
+        //     let mut bufr = repo
+        //         .as_oci()
+        //         .read_blob(&manifest_desc)
+        //         .map(BufReader::new)?;
+        //     let parsed = serde_json::from_reader::<_, ImageManifest>(&mut bufr)?;
+        //     let mut f = bufr.into_inner();
+        //     f.seek(std::io::SeekFrom::Start(0))?;
+        //     Ok((f, parsed))
+        // })
+        // .await
+        // .unwrap()
+        // .context("Reading manifest")?;
+        // // Read and parse the config in a helper thread
+        // let repo = self.clone();
+        // let config = manifest.config().clone();
+        // let config: ImageConfiguration = tokio::task::spawn_blocking(move || -> Result<_> {
+        //     repo.as_oci().read_json_blob(&config)
+        // })
+        // .await
+        // .unwrap()?;
 
-        // Walk the diffids, and find the ones we don't already have
-        let needed_diffs = manifest.layers().iter().enumerate().try_fold(
-            Vec::new(),
-            |mut acc, (i, layer)| -> Result<_> {
-                let diffid = config
-                    .rootfs()
-                    .diff_ids()
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("Missing diffid {i}"))?;
-                let diffid = DigestSha256::parse(&diffid)?;
-                if !self.has_layer(diffid.sha256())? {
-                    acc.push((layer, diffid));
-                }
-                Ok(acc)
-            },
-        )?;
+        // // Walk the diffids, and find the ones we don't already have
+        // let needed_diffs = manifest.layers().iter().enumerate().try_fold(
+        //     Vec::new(),
+        //     |mut acc, (i, layer)| -> Result<_> {
+        //         let diffid = config
+        //             .rootfs()
+        //             .diff_ids()
+        //             .get(i)
+        //             .ok_or_else(|| anyhow::anyhow!("Missing diffid {i}"))?;
+        //         let diffid = DigestSha256::parse(&diffid)?;
+        //         if !self.has_layer(diffid.sha256())? {
+        //             acc.push((layer, diffid));
+        //         }
+        //         Ok(acc)
+        //     },
+        // )?;
 
-        let mut stats = ImportLayerStats::default();
-        for (layer, diffid) in needed_diffs {
-            let blobsrc = self.as_oci().read_blob(layer)?;
-            stats = stats + self.import_layer(blobsrc, diffid.sha256()).await?;
-        }
+        // let mut stats = ImportLayerStats::default();
+        // for (layer, diffid) in needed_diffs {
+        //     let blobsrc = self.as_oci().read_blob(layer)?;
+        //     stats = stats + self.import_layer(blobsrc, diffid.sha256()).await?;
+        // }
 
-        if let Some(expected_digest) = manifest
-            .annotations()
-            .as_ref()
-            .and_then(|a| a.get(CFS_DIGEST_ANNOTATION))
-        {
-            // Handle verified manifests later
-            todo!()
-        } else {
-        }
+        // if let Some(expected_digest) = manifest
+        //     .annotations()
+        //     .as_ref()
+        //     .and_then(|a| a.get(CFS_DIGEST_ANNOTATION))
+        // {
+        //     // Handle verified manifests later
+        //     todo!()
+        // } else {
+        // }
 
-        Ok(stats)
+        // Ok(stats)
     }
 }
 
