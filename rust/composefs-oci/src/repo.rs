@@ -41,8 +41,14 @@ const CFSDIR: &str = "cfs";
 const REPOMETA: &str = "meta.json";
 /// A composefs/ostree style object directory
 const OBJECTS: &str = "objects";
+/// OCI container images, stored in a ready-to-run format
+const IMAGES: &str = "images";
+/// A subdirectory of images/ or artifacts/
+const TAGS: &str = "tags";
+/// A subdirectory of images/
 const LAYERS: &str = "layers";
-const MANIFESTS: &str = "images";
+/// Generic OCI artifacts (may be container images)
+const ARTIFACTS: &str = "artifacts/";
 const TMP: &str = "tmp";
 const LAYER_CFS: &str = "layer.cfs";
 const BOOTID_XATTR: &str = "user.composefs-oci.bootid";
@@ -462,7 +468,7 @@ impl Repo {
             })?;
         }
         // Object directories
-        for d in [OBJECTS, LAYERS, MANIFESTS] {
+        for d in [OBJECTS, LAYERS, IMAGES] {
             cfsdir.ensure_dir_with(d, dirbuilder).context(d)?;
             let objects = cfsdir.open_dir(d)?;
             init_object_dir(&objects)?;

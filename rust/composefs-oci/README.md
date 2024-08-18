@@ -19,51 +19,60 @@ ostree and containers/storage in supporting multiple
 versioned filesystem trees with associated metadata,
 including support for e.g. garbage collection.
 
+## composefs-mapped OCI image
+
+A "cfs-oci image" is a mapping of a standard OCI image
+into composefs. An OCI image is composed of 3 parts:
+
+- manifest
+- config
+- rootfs (layers)
+
+The mapping is simple; the manifest and config are JSON and are serialized
+into the toplevel, and the full *squashed* rootfs is stored in /rootfs.
+
+```
+/manifest.json
+/config.json
+/rootfs
+```
+
+This is designed to allow directly (natively) mounting the composefs and using
+the `/rootfs` subdirectory as the target root filesystem.
+
+## composefs-mapped OCI artifact
+
+OCI artifacts are more general, and are effectively
+
+```
+/manifest.json
+/config.json
+/layers/[0..n]
+```
+
+where each file in `layers/` is directory stored as a composefs
+object.
+
 ### Layout
 
-By default, a cfs-ocidir augments an [OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md).
+A cfs-ocidir has the following toplevel directories:
 
-However, media types of `application/vnd.oci.image.layer.v1.tar` may optionally be stored
-in a way that they can be natively mounted via composefs. This storage can be
-*additional* (which means storage cost is effectively the compressed size, plus uncompressed size)
-or an image can be "consumed" which means the compressed version is discarded.
-The tradeoff with this is that it is in general *not* possible to bit-for-bit
-reproduce the compressed blob again.
+- `images/`: A directory for OCI images (not generic artifacts) filled with composefs files (backed by `objects/`), named by their fsverity digest (split-checksum)
+- `images/tags/`: A directory of hard links to `images/`, with the file name being a URL encoding of the image name
+- `images/layers/`: A directory filled with composefs files (backed by `objects/`), named by their "diffid" (sha256) (split-checksum)
+   Each composefs file has a set of xattrs `user.composefs.blobid.0..n` where each value is the sha256 digest
+   of a corresponding compressed tar stream.
+- `artifacts/`: A directory for OCI artifacts, filled with composefs files, named by their fsverity digest (split-checksum)
+- `artifacts/tags`: A directory with hard links to `artifacts/`, with the file name being a URL encoding of the artifact name
+- `objects/`: A "split-checksum" object directory, used as the shared backing store for all composefs
+  files.
 
-#### Composefs ready layout
+Note that an artifact may *also* be an OCI image; it is not required to store OCI images "unpacked".
 
-cfs-ocidir augments the OCI image layout with a new `cfs/` directory.
-
-##### "split-checksum" format
+#### "split-checksum" format
 
 Side note: This follows a longstanding tradition of splitting up a checksum into (first two bytes, remaining bytes)
 creating subdirectories for the first two bytes. It is used by composefs by default.
-
-A cfs-ocidir has the following subdirectories:
-
-##### layers/
-
-This has "split-checksum" entries of the form `<diffid>.cfs` which are a composefs corresponding to the given diffid (tar layer).
-Each file MAY have xattrs of the form `user.cfs.compressed` which include the original compressed digest.
-
-##### objects/
-
-A composefs objects directory containing regular files, all of mode 0 (when run as root) or 0400 (when run as an unprivileged user)
-
-##### manifests
-
-This plays a role similar to the `manifests` array in https://github.com/opencontainers/image-spec/blob/main/image-index.md 
-
-This is also an object directory using the `sha256:` of the manifest digest.
-
-Each entry is a manifest (JSON). It is also recommended to make this a hardlink into the objects/ directory to enable sharing across cfs-oci directories.
-
-It is possible that the manifest has an native annotation `composefs.rootfs.digest` which is the composefs digest of the flattened/merged root. This is called a "composefs-enabled" manifest, which allows a signature that covers the manifest
-to also cover the composefs digest and allow efficient verification of the root filesystem for the image.
-
-If the manifest does not have that annotation, then the composefs digest is stored as an extended attribute `user.composefs.rootfs.digest`.
-
-That composefs digest can be used to look up the actual composefs superblock for the rootfs in the objects/ directory.
 
 ## CLI sketch: OCI container images
 
