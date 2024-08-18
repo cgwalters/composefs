@@ -22,7 +22,7 @@ use rustix::fs::AtFlags;
 use serde::{Deserialize, Serialize};
 
 use crate::fileutils;
-use crate::sha256descriptor::DescriptorExt;
+use crate::sha256descriptor::{DescriptorExt, Sha256Hex};
 
 /// Standardized metadata
 const REPOMETA: &str = "meta.json";
@@ -299,11 +299,46 @@ fn linkat_allow_exists(
     ))
 }
 
+// Rename all regular files from -> to. Non-regular files will be ignored.
+// If a target file with the given name already exists in "to", the file is left
+// in the "from" directory.
+async fn merge_dir_to(from: Dir, to: Dir) -> Result<()> {
+    let from_to = Arc::new((from, to));
+    let mut tasks = tokio::task::JoinSet::new();
+    for ent in from_to.0.entries()? {
+        let ent = ent?;
+        let ftype = ent.file_type()?;
+        if !ftype.is_file() {
+            continue;
+        }
+        let name = ent.file_name();
+        let from_to = Arc::clone(&from_to);
+        tasks.spawn_blocking(move || -> Result<()> {
+            let from = &from_to.0;
+            let to = &from_to.1;
+            let f = from.open(&name)?;
+            f.sync_all().context("fsync")?;
+            match from.rename(&name, &to, &name) {
+                Ok(()) => Ok(()),
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::AlreadyExists) => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        });
+    }
+    while let Some(r) = tasks.join_next().await {
+        r.context("join")?.context("Renaming into global")?;
+    }
+    Ok(())
+}
+
+async fn merge_dir_to_borrowed(from: &Dir, to: &Dir) -> Result<()> {
+    merge_dir_to(from.try_clone()?, to.try_clone()?).await
+}
+
 /// An opaque object representing an active transaction on the repository.
 #[derive(Debug)]
 pub struct RepoTransaction {
-    /// Reference to our parent's objects
-    global_objects: Dir,
+    parent: Arc<RepoInner>,
     // Our temporary directory
     workdir: TempDir,
     // A transaction is really just a temporary repository, that gets
@@ -314,8 +349,8 @@ pub struct RepoTransaction {
 
 impl RepoTransaction {
     fn new(repo: &Repo) -> Result<Self> {
+        let parent = Arc::clone(&repo.0);
         let global_tmp = &repo.0.dir.open_dir(TMP).context(TMP)?;
-        let global_objects = repo.0.objects.try_clone()?;
         let workdir = {
             let d = TempDir::new_in(global_tmp)?;
             fileutils::fsetxattr(
@@ -330,7 +365,7 @@ impl RepoTransaction {
         let reuse_object_dirs = Arc::clone(&repo.0.reuse_object_dirs);
         let temp_repo = Repo::init_full(&workdir, repo.has_verity(), reuse_object_dirs)?;
         let r = RepoTransaction {
-            global_objects,
+            parent,
             workdir,
             repo: temp_repo,
             stats: Default::default(),
@@ -406,32 +441,6 @@ impl RepoTransaction {
         Ok(())
     }
 
-    // Rename all objects from -> to with the given prefix (first two bytes in hex)
-    async fn commit_objects_in(from: &Dir, to: &Dir, prefix: &str) -> Result<()> {
-        let src = Arc::new(from.open_dir(prefix).context("tmp objects")?);
-        let dest = Arc::new(to.open_dir(prefix).context("global objects")?);
-        let mut tasks = tokio::task::JoinSet::new();
-        for ent in src.entries()? {
-            let ent = ent?;
-            let name = ent.file_name();
-            let src = Arc::clone(&src);
-            let dest = Arc::clone(&dest);
-            tasks.spawn_blocking(move || -> Result<()> {
-                let f = src.open(&name)?;
-                f.sync_all().context("fsync")?;
-                match src.rename(&name, &dest, &name) {
-                    Ok(()) => Ok(()),
-                    Err(e) if matches!(e.kind(), std::io::ErrorKind::AlreadyExists) => Ok(()),
-                    Err(e) => Err(e.into()),
-                }
-            });
-        }
-        while let Some(r) = tasks.join_next().await {
-            r.context("join")?.context("Renaming into global")?;
-        }
-        Ok(())
-    }
-
     #[context("Committing objects")]
     // Given two "split checksum" directories, rename all files from -> to
     async fn commit_objects(from: &Dir, to: &Dir) -> Result<()> {
@@ -444,9 +453,9 @@ impl RepoTransaction {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            Self::commit_objects_in(from, to, name)
-                .await
-                .with_context(|| name.to_owned())?;
+            let from = from.open_dir(&name).context("tmp objects")?;
+            let to = to.open_dir(&name).context("global objects")?;
+            merge_dir_to(from, to).await?;
         }
         Ok(())
     }
@@ -470,7 +479,7 @@ impl RepoTransaction {
         buf.insert(2, '/');
         let buf = Utf8PathBuf::from(buf);
         let objpath = buf.as_std_path();
-        let exists_globally = self.global_objects.try_exists(&buf)?;
+        let exists_globally = self.parent.objects.try_exists(&buf)?;
         let exists_locally = !exists_globally && my_objects.try_exists(&buf)?;
         if !(exists_globally || exists_locally) {
             let reuse_dirs = self.repo.0.reuse_object_dirs.lock().unwrap();
@@ -487,7 +496,7 @@ impl RepoTransaction {
             let mut stats = self.stats.lock().unwrap();
             stats.extant_objects_count += 1;
             stats.extant_objects_size += size;
-            linkat_allow_exists(&self.global_objects.as_fd(), objpath, &my_objects, objpath)
+            linkat_allow_exists(&self.parent.objects.as_fd(), objpath, &my_objects, objpath)
                 .with_context(|| format!("Linking extant object {buf}"))?;
         } else {
             if !exists_locally {
@@ -498,6 +507,23 @@ impl RepoTransaction {
             }
         }
         Ok(buf)
+    }
+
+    fn import_object_and_by_sha256(
+        &self,
+        mut tmpfile: TempFile,
+        sha256: Sha256Hex,
+    ) -> Result<Utf8PathBuf> {
+        let objpath = self.import_object(tmpfile)?;
+        let mut by_sha256_path = String::from(OBJECTS_BY_SHA256);
+        append_object_path(&mut by_sha256_path, &sha256)?;
+        linkat_allow_exists(
+            &self.repo.0.objects,
+            &objpath,
+            &self.repo.0.dir,
+            &by_sha256_path,
+        )?;
+        Ok(objpath)
     }
 
     #[context("Unpacking regfile")]
@@ -532,7 +558,19 @@ impl RepoTransaction {
 
     // Commit this transaction, returning statistics
     async fn commit(self) -> Result<TransactionStats> {
-        Self::commit_objects(&self.repo.0.objects, &self.global_objects).await?;
+        let from_basedir =&self.repo.0.dir;
+        let to_basedir = &self.parent.dir;
+        Self::commit_objects(&self.repo.0.objects, &self.parent.objects).await?;
+        {
+            let from_by_sha256 = from_basedir.open_dir(OBJECTS_BY_SHA256)?;
+            let to_by_sha256 = from_basedir.open_dir(OBJECTS_BY_SHA256)?;
+            Self::commit_objects(&from_by_sha256, &to_by_sha256).await?;
+        }
+        {
+            let from_tags = from_basedir.open_dir(TAGS).context(TAGS)?;
+            let to_tags = to_basedir.open_dir(TAGS).context(TAGS)?;
+            merge_dir_to(from_tags, to_tags).await.context("Committing tags")?;
+        }
         // SAFETY: This just propagates panics, which is OK
         Ok(self.stats.into_inner().unwrap())
     }
@@ -746,7 +784,7 @@ impl Repo {
             let size = layer.size().try_into().context("Invalid size")?;
             let (blob_reader, driver) = proxy.get_blob(&img, layer.digest(), size).await?;
             let mut sync_blob_reader = tokio_util::io::SyncIoBridge::new(blob_reader);
-            // Cheap clone
+            // Clone to move into worker thread
             let layer = layer.clone();
             let txn = Arc::clone(&txn);
             let import_task = tokio::task::spawn_blocking(move || -> Result<_> {
@@ -754,14 +792,12 @@ impl Repo {
                 let mut blobwriter = DescriptorWriter::new(tmpf)?;
                 let _n: u64 = std::io::copy(&mut sync_blob_reader, &mut blobwriter)?;
                 let tmpf = blobwriter.finish_validate(&layer)?;
-                txn.import_object(tmpf)?;
-                let mut objpath = String::from(OBJECTS_BY_SHA256);
-                append_object_path(&mut objpath, &layer.sha256()?)?;
-                Ok(layer)
+                txn.import_object_and_by_sha256(tmpf, layer.sha256()?)?;
+                Ok(())
             });
             let (import_task, driver) = tokio::join!(import_task, driver);
             let _: () = driver?;
-            let _: Descriptor = import_task.unwrap()?;
+            let _: () = import_task.unwrap()?;
         }
 
         // let repo = self.clone();
