@@ -4,10 +4,8 @@ use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 
 use clap::Parser;
-use ocidir::cap_std::{
-    self,
-    fs::{Dir},
-};
+use cap_std::fs::Dir;
+use ocidir::cap_std;
 use pull::cli_pull;
 
 mod digestsha256;

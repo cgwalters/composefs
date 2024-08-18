@@ -16,6 +16,7 @@ ocidir = { version = "0.2.1" }
 openssl = "0.10.33"
 rustix = { version = "0.38.34", features = ["fs"] }
 libc = "0.2"
+percent-encoding = "2"
 serde = "1"
 tar = "0.4.38"
 tokio = { features = ["io-std", "time", "process", "rt", "net"], version = ">= 1.13.0" }

@@ -1,37 +1,25 @@
-
-
 use std::fs::File;
 use std::io::{self, Seek, Write};
 use std::ops::Add;
 use std::os::fd::AsFd;
-use std::path::{Path};
-
-
-
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
-
+use camino::Utf8PathBuf;
 use cap_std::fs::Dir;
-use cap_std_ext::cap_std::fs::{DirBuilderExt, PermissionsExt};
 use cap_std_ext::cap_tempfile::{TempDir, TempFile};
-
 use cap_std_ext::dirext::CapStdExtDirExt;
 use cap_std_ext::{cap_std, cap_tempfile};
-use composefs::dumpfile::{Entry};
+use composefs::dumpfile::Entry;
 use composefs::fsverity::Digest;
-
 use fn_error_context::context;
 use ocidir::cap_std::fs::MetadataExt;
-use ocidir::oci_spec::image::{
-    Descriptor, MediaType,
-};
-
+use ocidir::oci_spec::image::{Descriptor, MediaType};
 use openssl::hash::{Hasher, MessageDigest};
-use rustix::fd::{BorrowedFd};
-use rustix::fs::{AtFlags};
+use rustix::fd::BorrowedFd;
+use rustix::fs::AtFlags;
 use serde::{Deserialize, Serialize};
-
 
 use crate::fileutils;
 use crate::sha256descriptor::DescriptorExt;
@@ -199,11 +187,11 @@ impl<'a> std::io::Write for DescriptorWriter<'a> {
 }
 
 impl<'a> DescriptorWriter<'a> {
-    fn new(dir: &'a Dir) -> Result<Self> {
+    fn new(tmpf: TempFile<'a>) -> Result<Self> {
         Ok(Self {
             sha256hasher: Hasher::new(MessageDigest::sha256())?,
             // FIXME add ability to choose filename after completion
-            target: Some(cap_tempfile::TempFile::new(dir)?),
+            target: Some(tmpf),
             size: 0,
         })
     }
@@ -280,34 +268,46 @@ fn linkat_optional_allow_exists(
     }
 }
 
+fn ignore_rustix_eexist(r: rustix::io::Result<()>) -> Result<()> {
+    match r {
+        Ok(()) => Ok(()),
+        Err(e) if e == rustix::io::Errno::EXIST => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn ignore_std_eexist(r: io::Result<()>) -> Result<()> {
+    match r {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn linkat_allow_exists(
-    old_dirfd: &Dir,
+    old_dirfd: impl AsFd,
     old_path: impl AsRef<Path>,
-    new_dirfd: &Dir,
+    new_dirfd: impl AsFd,
     new_path: impl AsRef<Path>,
-) -> Result<bool> {
-    match rustix::fs::linkat(
+) -> Result<()> {
+    ignore_rustix_eexist(rustix::fs::linkat(
         old_dirfd.as_fd(),
         old_path.as_ref(),
         new_dirfd.as_fd(),
         new_path.as_ref(),
         AtFlags::empty(),
-    ) {
-        // We successfully linked
-        Ok(()) => Ok(true),
-        // We're idempotent; it's ok if the target already exists
-        Err(e) if e == rustix::io::Errno::EXIST => Ok(true),
-        Err(e) => Err(e.into()),
-    }
+    ))
 }
 
-struct RepoTransaction {
+#[derive(Debug)]
+pub struct RepoTransaction {
     /// Reference to our parent's objects
     global_objects: Dir,
     // Our temporary directory
     workdir: TempDir,
     // Temp is just a view into workdir
     repo: Repo,
+    stats: Arc<Mutex<TransactionStats>>,
 }
 
 impl RepoTransaction {
@@ -323,7 +323,7 @@ impl RepoTransaction {
                 rustix::fs::XattrFlags::empty(),
             )
             .context("setting bootid xattr")?;
-        d
+            d
         };
         let reuse_object_dirs = Arc::clone(&repo.0.reuse_object_dirs);
         let temp_repo = Repo::init_full(&workdir, repo.has_verity(), reuse_object_dirs)?;
@@ -331,17 +331,21 @@ impl RepoTransaction {
             global_objects,
             workdir,
             repo: temp_repo,
+            stats: Default::default(),
         };
         Ok(r)
     }
 
-    fn import_tar(&self, src: File) -> Result<ImportLayerStats> {
-        let mut stats = ImportLayerStats::default();
+    fn new_object(&self) -> Result<TempFile> {
+        TempFile::new(&self.repo.0.objects).map_err(Into::into)
+    }
+
+    fn import_tar(&self, src: File) -> Result<()> {
         let src = std::io::BufReader::new(src);
         let mut archive = tar::Archive::new(src);
 
         let layer_root = fileutils::openat_rooted(self.workdir.as_fd(), "root")
-        .context("Opening sandboxed layer dir")?;
+            .context("Opening sandboxed layer dir")?;
 
         for entry in archive.entries()? {
             let entry = entry?;
@@ -359,7 +363,7 @@ impl RepoTransaction {
                 tar::EntryType::Regular => {
                     // Copy as we need to refer to it after processing the entry
                     let path = path.into_owned();
-                    self.unpack_regfile(entry, layer_root.as_fd(),&path, &mut stats)?;
+                    self.unpack_regfile(entry, layer_root.as_fd(), &path)?;
                 }
                 tar::EntryType::Link => {
                     let target = entry
@@ -374,7 +378,8 @@ impl RepoTransaction {
                         AtFlags::empty(),
                     )
                     .with_context(|| format!("hardlinking {path:?} to {target:?}"))?;
-                    stats.meta_count += 1;
+                let mut stats = self.stats.lock().unwrap();
+                stats.meta_count += 1;
                 }
                 tar::EntryType::Symlink => {
                     let target = entry
@@ -383,6 +388,7 @@ impl RepoTransaction {
                         .ok_or_else(|| anyhow::anyhow!("Missing hardlink target"))?;
                     rustix::fs::symlinkat(&*target, layer_root.as_fd(), &*path)
                         .with_context(|| format!("symlinking {path:?} to {target:?}"))?;
+                    let mut stats = self.stats.lock().unwrap();
                     stats.meta_count += 1;
                 }
                 tar::EntryType::Char | tar::EntryType::Block => {
@@ -395,16 +401,13 @@ impl RepoTransaction {
                 o => anyhow::bail!("Unhandled entry type: {o:?}"),
             }
         }
-        Ok(stats)
+        Ok(())
     }
 
+    // Rename all objects from -> to with the given prefix (first two bytes in hex)
     async fn commit_objects_in(from: &Dir, to: &Dir, prefix: &str) -> Result<()> {
         let src = Arc::new(from.open_dir(prefix).context("tmp objects")?);
-        let dest = Arc::new(
-            to
-                .open_dir(prefix)
-                .context("global objects")?,
-        );
+        let dest = Arc::new(to.open_dir(prefix).context("global objects")?);
         let mut tasks = tokio::task::JoinSet::new();
         for ent in src.entries()? {
             let ent = ent?;
@@ -428,6 +431,7 @@ impl RepoTransaction {
     }
 
     #[context("Committing objects")]
+    // Given two "split checksum" directories, rename all files from -> to
     async fn commit_objects(from: &Dir, to: &Dir) -> Result<()> {
         for d in from.entries()? {
             let d = d?;
@@ -446,7 +450,10 @@ impl RepoTransaction {
     }
 
     #[context("Importing object")]
-    fn import_object(&self, mut tmpfile: TempFile, dest: BorrowedFd, path: &Path, stats: &mut ImportLayerStats) -> Result<()> {
+    fn import_object(
+        &self,
+        mut tmpfile: TempFile,
+    ) -> Result<Utf8PathBuf> {
         let my_objects = &self.repo.0.objects;
         let size = tmpfile.as_file().metadata()?.size();
         // Compute its composefs digest.  This can be an expensive operation,
@@ -462,45 +469,41 @@ impl RepoTransaction {
             .context("Computing fsverity digest")?;
         let mut buf = hex::encode(digest.get());
         buf.insert(2, '/');
+        let buf = Utf8PathBuf::from(buf);
+        let objpath = buf.as_std_path();
         let exists_globally = self.global_objects.try_exists(&buf)?;
         let exists_locally = !exists_globally && my_objects.try_exists(&buf)?;
         if !(exists_globally || exists_locally) {
             let reuse_dirs = self.repo.0.reuse_object_dirs.lock().unwrap();
             for d in reuse_dirs.iter() {
                 if linkat_optional_allow_exists(d, &buf, &my_objects, &buf)? {
+                    let mut stats = self.stats.lock().unwrap();
                     stats.external_objects_count += 1;
                     stats.external_objects_size += size;
-                    return Ok(());
+                    return Ok(buf);
                 }
             }
         };
         if exists_globally {
+            let mut stats = self.stats.lock().unwrap();
             stats.extant_objects_count += 1;
             stats.extant_objects_size += size;
-            rustix::fs::linkat(
+            linkat_allow_exists(
                 &self.global_objects.as_fd(),
-                &buf,
-                dest,
-                path,
-                AtFlags::empty(),
+                objpath,
+                &my_objects,
+                objpath,
             )
-            .with_context(|| format!("Linking extant object {buf} to {path:?}"))?;
+            .with_context(|| format!("Linking extant object {buf}"))?;
         } else {
             if !exists_locally {
-                tmpfile.replace(&buf).context("tmpfile replace")?;
+                ignore_std_eexist(tmpfile.replace(&buf)).context("tmpfile replace")?;
+                let mut stats = self.stats.lock().unwrap();
                 stats.imported_objects_count += 1;
                 stats.imported_objects_size += size;
             }
-            rustix::fs::linkat(
-                my_objects.as_fd(),
-                &buf,
-                dest,
-                path,
-                AtFlags::empty(),
-            )
-            .with_context(|| format!("Linking tmp object {buf} to {path:?}"))?;
         }
-        Ok(())
+        Ok(buf)
     }
 
     #[context("Unpacking regfile")]
@@ -509,7 +512,6 @@ impl RepoTransaction {
         mut entry: tar::Entry<E>,
         layer_root: BorrowedFd,
         path: &Path,
-        stats: &mut ImportLayerStats,
     ) -> Result<()> {
         // First, spool the file content to a temporary file
         let mut tmpfile = TempFile::new(&self.workdir).context("Creating tmpfile")?;
@@ -523,12 +525,17 @@ impl RepoTransaction {
         // This should always be true, but just in case
         anyhow::ensure!(size == wrote_size);
 
-        self.import_object(tmpfile, layer_root, path, stats)
+        let objpath = self.import_object(tmpfile)?;
+        rustix::fs::linkat(&self.repo.0.objects, objpath.as_std_path(), layer_root, path, AtFlags::empty())?;
+        Ok(())
     }
 
-    // 
-    async fn commit(self) -> Result<()> {
-        Self::commit_objects(&self.repo.0.objects, &self.global_objects).await
+    //
+    async fn commit(self: Arc<Self>) -> Result<TransactionStats> {
+        let me = Arc::try_unwrap(self).unwrap();
+        Self::commit_objects(&me.repo.0.objects, &me.global_objects).await?;
+        Ok(Arc::into_inner(me.stats).unwrap().into_inner().unwrap())
+
     }
 }
 
@@ -551,8 +558,11 @@ impl Repo {
         Self::init_full(dir, require_verity, reuse_object_dirs)
     }
 
-    fn init_full(dir: &Dir, require_verity: bool, reuse_object_dirs: SharedObjectDirs) -> Result<Self> {
-
+    fn init_full(
+        dir: &Dir,
+        require_verity: bool,
+        reuse_object_dirs: SharedObjectDirs,
+    ) -> Result<Self> {
         let supports_verity = test_fsverity_in(&dir)?;
         if require_verity && !supports_verity {
             anyhow::bail!("Requested fsverity, but target does not support it");
@@ -612,6 +622,10 @@ impl Repo {
         Self::impl_open(dir, Default::default())
     }
 
+    pub fn new_transaction(&self) -> Result<Arc<RepoTransaction>> {
+        Ok(Arc::new(RepoTransaction::new(&self)?))
+    }
+
     /// Path to a directory with a composefs objects/ directory
     /// that will be used opportunistically as a source of objects.
     ///
@@ -658,7 +672,7 @@ impl Repo {
     }
 
     #[context("Importing layer")]
-    pub async fn import_layer(&self, src: File, diffid: &str) -> Result<ImportLayerStats> {
+    pub async fn import_layer(&self, txn: Arc<RepoTransaction>, src: File, diffid: &str) -> Result<()> {
         let mut layer_path = format!("{IMAGES}/{LAYERS}");
         append_object_path(&mut layer_path, diffid)?;
         // If we've already fetched the layer, then assume the caller is forcing a re-import
@@ -669,14 +683,8 @@ impl Repo {
                 .remove_dir_all(&layer_path)
                 .context("removing extant layerdir")?;
         }
-        let tx = RepoTransaction::new(&self)?;
-        let (tx, stats) = tokio::task::spawn_blocking(move || {
-            let stats = tx.import_tar(src)?;
-            anyhow::Ok((tx, stats))
-        })
-        .await??;
-        tx.commit().await?;
-        Ok(stats)
+        tokio::task::spawn_blocking(move || { txn.import_tar(src) }).await??;
+        Ok(())
     }
 
     /// Pull the target artifact
@@ -686,7 +694,7 @@ impl Repo {
         imgref: &str,
     ) -> Result<Descriptor> {
         let img = proxy.open_image(&imgref).await?;
-        let _tx = RepoTransaction::new(&self)?;
+        let tx = Arc::new(RepoTransaction::new(&self)?);
         let (manifest_digest, raw_manifest) = proxy.fetch_manifest_raw_oci(&img).await?;
         let manifest_descriptor = Descriptor::new(
             ocidir::oci_spec::image::MediaType::ImageManifest,
@@ -698,7 +706,7 @@ impl Repo {
             println!("Already stored: {manifest_digest}");
             return Ok(manifest_descriptor);
         }
-        let _config = proxy.fetch_config(&img).await?;
+        let config = proxy.fetch_config(&img).await?;
         // let platform = PlatformBuilder::default()
         //     .architecture(config.architecture().clone())
         //     .os(config.os().clone())
@@ -723,12 +731,14 @@ impl Repo {
             let (blob_reader, driver) = proxy.get_blob(&img, layer.digest(), size).await?;
             let mut sync_blob_reader = tokio_util::io::SyncIoBridge::new(blob_reader);
             // Cheap clone
-            let repo = self.clone();
             let layer = layer.clone();
+            let tx = Arc::clone(&tx);
             let import_task = tokio::task::spawn_blocking(move || -> Result<_> {
-                let mut blobwriter = DescriptorWriter::new(&repo.0.dir)?;
+                let tmpf = tx.new_object()?;
+                let mut blobwriter = DescriptorWriter::new(tmpf)?;
                 let _n: u64 = std::io::copy(&mut sync_blob_reader, &mut blobwriter)?;
-                let _tmpf = blobwriter.finish_validate(&layer)?;
+                let tmpf = blobwriter.finish_validate(&layer)?;
+                tx.import_object(tmpf)?;
                 let mut objpath = String::from(OBJECTS_BY_SHA256);
                 append_object_path(&mut objpath, &layer.sha256()?)?;
                 Ok(layer)
@@ -749,7 +759,7 @@ impl Repo {
 
     /// Ensure that a downloaded OCI image is "expanded" (unpacked)
     /// into the composefs-native store.
-    pub async fn expand(&self, _manifest_desc: &Descriptor) -> Result<ImportLayerStats> {
+    pub async fn expand(&self, _manifest_desc: &Descriptor) -> Result<TransactionStats> {
         todo!()
         // let repo = self.clone();
         // let manifest_desc = manifest_desc.clone();
@@ -814,7 +824,7 @@ impl Repo {
 }
 
 #[derive(Debug, Default)]
-pub struct ImportLayerStats {
+pub struct TransactionStats {
     /// Existing regular file count
     extant_objects_count: usize,
     /// Existing regular file size
@@ -834,7 +844,7 @@ pub struct ImportLayerStats {
     meta_count: u64,
 }
 
-impl Add for ImportLayerStats {
+impl Add for TransactionStats {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
@@ -852,10 +862,8 @@ impl Add for ImportLayerStats {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{BufWriter},
-        process::Command,
-    };
+    use std::io::BufWriter;
+    use std::process::Command;
 
     use super::*;
 
@@ -882,16 +890,17 @@ mod tests {
         assert!(!repo.has_layer(EMPTY_DIFFID).unwrap());
 
         // A no-op import
-        let r = repo
-            .import_layer(new_memfd(b"")?, EMPTY_DIFFID)
+        let txn = repo.new_transaction()?;
+        repo
+            .import_layer(Arc::clone(&txn), new_memfd(b"")?, EMPTY_DIFFID)
             .await
             .unwrap();
+        let r = txn.commit().await.unwrap();
         assert_eq!(r.extant_objects_count, 0);
         assert_eq!(r.imported_objects_count, 0);
         assert_eq!(r.imported_objects_size, 0);
 
         // Serialize our own source code
-
         let testtar = td.create("test.tar").map(BufWriter::new)?;
         let mut testtar = tar::Builder::new(testtar);
         testtar.follow_symlinks(false);
@@ -908,7 +917,9 @@ mod tests {
         let digest = digest.split_ascii_whitespace().next().unwrap().trim();
         let testtar = td.open("test.tar")?;
 
-        repo.import_layer(testtar.into_std(), digest).await.unwrap();
+        let txn = repo.new_transaction()?;
+        repo.import_layer(Arc::clone(&txn), testtar.into_std(), digest).await.unwrap();
+        txn.commit().await.unwrap();
 
         Ok(())
     }

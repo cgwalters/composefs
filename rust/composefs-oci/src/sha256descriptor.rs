@@ -1,5 +1,3 @@
-use std::{ops::Deref};
-
 use anyhow::Result;
 use ocidir::oci_spec::image::Descriptor;
 
@@ -20,7 +18,7 @@ impl<'a> Sha256Hex<'a> {
     }
 }
 
-impl<'a> Deref for Sha256Hex<'a> {
+impl<'a> std::ops::Deref for Sha256Hex<'a> {
     type Target = str;
 
     fn deref(&self) -> &Self::Target {
