@@ -531,10 +531,9 @@ impl RepoTransaction {
     }
 
     //
-    async fn commit(self: Arc<Self>) -> Result<TransactionStats> {
-        let me = Arc::try_unwrap(self).unwrap();
-        Self::commit_objects(&me.repo.0.objects, &me.global_objects).await?;
-        Ok(Arc::into_inner(me.stats).unwrap().into_inner().unwrap())
+    async fn commit(self) -> Result<TransactionStats> {
+        Self::commit_objects(&self.repo.0.objects, &self.global_objects).await?;
+        Ok(Arc::into_inner(self.stats).unwrap().into_inner().unwrap())
 
     }
 }
@@ -622,8 +621,8 @@ impl Repo {
         Self::impl_open(dir, Default::default())
     }
 
-    pub fn new_transaction(&self) -> Result<Arc<RepoTransaction>> {
-        Ok(Arc::new(RepoTransaction::new(&self)?))
+    pub fn new_transaction(&self) -> Result<RepoTransaction> {
+        RepoTransaction::new(&self)
     }
 
     /// Path to a directory with a composefs objects/ directory
@@ -672,7 +671,7 @@ impl Repo {
     }
 
     #[context("Importing layer")]
-    pub async fn import_layer(&self, txn: Arc<RepoTransaction>, src: File, diffid: &str) -> Result<()> {
+    pub async fn import_layer(&self, txn: RepoTransaction, src: File, diffid: &str) -> Result<RepoTransaction> {
         let mut layer_path = format!("{IMAGES}/{LAYERS}");
         append_object_path(&mut layer_path, diffid)?;
         // If we've already fetched the layer, then assume the caller is forcing a re-import
@@ -683,8 +682,8 @@ impl Repo {
                 .remove_dir_all(&layer_path)
                 .context("removing extant layerdir")?;
         }
-        tokio::task::spawn_blocking(move || { txn.import_tar(src) }).await??;
-        Ok(())
+        // SAFETY: Panic if we can't join the thread
+        tokio::task::spawn_blocking(move || { txn.import_tar(src)?; Ok(txn) }).await.unwrap()
     }
 
     /// Pull the target artifact
@@ -891,8 +890,8 @@ mod tests {
 
         // A no-op import
         let txn = repo.new_transaction()?;
-        repo
-            .import_layer(Arc::clone(&txn), new_memfd(b"")?, EMPTY_DIFFID)
+        let txn = repo
+            .import_layer(txn, new_memfd(b"")?, EMPTY_DIFFID)
             .await
             .unwrap();
         let r = txn.commit().await.unwrap();
@@ -918,7 +917,7 @@ mod tests {
         let testtar = td.open("test.tar")?;
 
         let txn = repo.new_transaction()?;
-        repo.import_layer(Arc::clone(&txn), testtar.into_std(), digest).await.unwrap();
+        let txn = repo.import_layer(txn, testtar.into_std(), digest).await.unwrap();
         txn.commit().await.unwrap();
 
         Ok(())
