@@ -299,15 +299,17 @@ fn linkat_allow_exists(
     ))
 }
 
+/// An opaque object representing an active transaction on the repository.
 #[derive(Debug)]
 pub struct RepoTransaction {
     /// Reference to our parent's objects
     global_objects: Dir,
     // Our temporary directory
     workdir: TempDir,
-    // Temp is just a view into workdir
+    // A transaction is really just a temporary repository, that gets
+    // merged into our parent on commit
     repo: Repo,
-    stats: Arc<Mutex<TransactionStats>>,
+    stats: Mutex<TransactionStats>,
 }
 
 impl RepoTransaction {
@@ -528,10 +530,17 @@ impl RepoTransaction {
         Ok(())
     }
 
-    //
+    // Commit this transaction, returning statistics
     async fn commit(self) -> Result<TransactionStats> {
         Self::commit_objects(&self.repo.0.objects, &self.global_objects).await?;
-        Ok(Arc::into_inner(self.stats).unwrap().into_inner().unwrap())
+        // SAFETY: This just propagates panics, which is OK
+        Ok(self.stats.into_inner().unwrap())
+    }
+
+    /// Abort this transaction; no changes will be made to the underlying repository.
+    pub fn discard(self) -> Result<()> {
+        self.workdir.close()?;
+        Ok(())
     }
 }
 
@@ -696,11 +705,11 @@ impl Repo {
     /// Pull the target artifact
     pub async fn pull_artifact(
         &self,
+        txn: RepoTransaction,
         proxy: &containers_image_proxy::ImageProxy,
         imgref: &str,
-    ) -> Result<Descriptor> {
+    ) -> Result<(RepoTransaction, Descriptor)> {
         let img = proxy.open_image(&imgref).await?;
-        let tx = Arc::new(RepoTransaction::new(&self)?);
         let (manifest_digest, raw_manifest) = proxy.fetch_manifest_raw_oci(&img).await?;
         let manifest_descriptor = Descriptor::new(
             ocidir::oci_spec::image::MediaType::ImageManifest,
@@ -710,8 +719,9 @@ impl Repo {
 
         if self.has_artifact_manifest(&manifest_descriptor)? {
             println!("Already stored: {manifest_digest}");
-            return Ok(manifest_descriptor);
+            return Ok((txn, manifest_descriptor));
         }
+        let txn = Arc::new(txn);
         let config = proxy.fetch_config(&img).await?;
         // let platform = PlatformBuilder::default()
         //     .architecture(config.architecture().clone())
@@ -738,13 +748,13 @@ impl Repo {
             let mut sync_blob_reader = tokio_util::io::SyncIoBridge::new(blob_reader);
             // Cheap clone
             let layer = layer.clone();
-            let tx = Arc::clone(&tx);
+            let txn = Arc::clone(&txn);
             let import_task = tokio::task::spawn_blocking(move || -> Result<_> {
-                let tmpf = tx.new_object()?;
+                let tmpf = txn.new_object()?;
                 let mut blobwriter = DescriptorWriter::new(tmpf)?;
                 let _n: u64 = std::io::copy(&mut sync_blob_reader, &mut blobwriter)?;
                 let tmpf = blobwriter.finish_validate(&layer)?;
-                tx.import_object(tmpf)?;
+                txn.import_object(tmpf)?;
                 let mut objpath = String::from(OBJECTS_BY_SHA256);
                 append_object_path(&mut objpath, &layer.sha256()?)?;
                 Ok(layer)
@@ -760,7 +770,7 @@ impl Repo {
         // })
         // .await
         // .unwrap()
-        Ok(manifest_descriptor)
+        Ok((Arc::into_inner(txn).unwrap(), manifest_descriptor))
     }
 
     /// Ensure that a downloaded OCI image is "expanded" (unpacked)
@@ -826,6 +836,11 @@ impl Repo {
         // }
 
         // Ok(stats)
+    }
+
+    // Commit this transaction, returning statistics
+    pub async fn commit(&self, txn: RepoTransaction) -> Result<TransactionStats> {
+        txn.commit().await
     }
 }
 
