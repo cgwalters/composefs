@@ -1,38 +1,38 @@
-use std::borrow::{Borrow, Cow};
-use std::cell::OnceCell;
+
+
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Seek, Write};
+use std::io::{self, Seek, Write};
 use std::ops::Add;
 use std::os::fd::AsFd;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::str::FromStr;
-use std::sync::mpsc::SyncSender;
+use std::path::{Path};
+
+
+
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
-use camino::Utf8Path;
+
 use cap_std::fs::Dir;
-use cap_std_ext::cap_std::fs::{DirBuilder, DirBuilderExt, PermissionsExt};
+use cap_std_ext::cap_std::fs::{DirBuilderExt, PermissionsExt};
 use cap_std_ext::cap_tempfile::{TempDir, TempFile};
-use cap_std_ext::cmdext::CapStdExtCommandExt;
+
 use cap_std_ext::dirext::CapStdExtDirExt;
 use cap_std_ext::{cap_std, cap_tempfile};
-use composefs::dumpfile::{self, Entry};
+use composefs::dumpfile::{Entry};
 use composefs::fsverity::Digest;
-use composefs::mkcomposefs::{self, mkcomposefs};
+
 use fn_error_context::context;
 use ocidir::cap_std::fs::MetadataExt;
 use ocidir::oci_spec::image::{
-    Descriptor, ImageConfiguration, ImageManifest, MediaType, Platform, PlatformBuilder,
+    Descriptor, MediaType,
 };
-use ocidir::OciDir;
+
 use openssl::hash::{Hasher, MessageDigest};
-use rustix::fd::{AsRawFd, BorrowedFd};
-use rustix::fs::{openat, AtFlags};
+use rustix::fd::{BorrowedFd};
+use rustix::fs::{AtFlags};
 use serde::{Deserialize, Serialize};
 
-use crate::digestsha256::DigestSha256;
+
 use crate::fileutils;
 use crate::sha256descriptor::DescriptorExt;
 
@@ -53,21 +53,19 @@ const LAYERS: &str = "layers";
 /// Generic OCI artifacts (may be container images)
 const ARTIFACTS: &str = "artifacts/";
 const TMP: &str = "tmp";
-const LAYER_CFS: &str = "layer.cfs";
 const BOOTID_XATTR: &str = "user.composefs-oci.bootid";
-/// A container including content here is basically trying to
-/// do something malicious, so we'll just reject it.
-const API_FILESYSTEMS: &[&str] = &["proc", "sys", "dev"];
 
 /// Can be included in a manifest if the digest is pre-computed
 const CFS_DIGEST_ANNOTATION: &str = "composefs.rootfs.digest";
 
+type SharedObjectDirs = Arc<Mutex<Vec<Dir>>>;
+
 /// The extended attribute we attach with the target metadata
-const CFS_ENTRY_META_XATTR: &str = "user.cfs.entry.meta";
+// const CFS_ENTRY_META_XATTR: &str = "user.cfs.entry.meta";
 /// This records the virtual number of links (as opposed to
 /// the physical, because we may share multiple regular files
 /// by hardlinking into the object store).
-const CFS_ENTRY_META_NLINK: &str = "user.cfs.entry.nlink";
+// const CFS_ENTRY_META_NLINK: &str = "user.cfs.entry.nlink";
 
 ///
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,7 +117,7 @@ fn get_bootid() -> &'static str {
     bootid.as_str()
 }
 
-fn create_entry(h: tar::Header) -> Result<Entry<'static>> {
+fn create_entry(_h: tar::Header) -> Result<Entry<'static>> {
     // let size = h.size()?;
     // let path = &*h.path()?;
     // let path = Utf8Path::from_path(path)
@@ -164,15 +162,6 @@ fn create_entry(h: tar::Header) -> Result<Entry<'static>> {
 
     todo!()
 }
-
-// fn reject_api_filesystem_path(p: &Path) -> Result<()> {
-//     for part in API_FILESYSTEMS {
-//         if let Ok(r) = p.strip_prefix(part) {
-
-//         }
-//     }
-//     Ok(())
-// }
 
 /// A writer which writes an object identified by sha256.
 pub struct DescriptorWriter<'a> {
@@ -313,24 +302,19 @@ fn linkat_allow_exists(
 }
 
 struct RepoTransaction {
-    has_verity: bool,
-    /// Reference to global objects
+    /// Reference to our parent's objects
     global_objects: Dir,
-    // Temporary directory for layer import;
-    // This contains:
-    //  - objects/   Regular file content (not fsync'd yet!)
-    //  - root/      The layer rootfs
+    // Our temporary directory
     workdir: TempDir,
-    // Handle for objects/ above
-    tmp_objects: Dir,
-    reuse_object_dirs: Arc<Mutex<Vec<Dir>>>,
+    // Temp is just a view into workdir
+    repo: Repo,
 }
 
 impl RepoTransaction {
     fn new(repo: &Repo) -> Result<Self> {
         let global_tmp = &repo.0.dir.open_dir(TMP).context(TMP)?;
-        let global_objects = repo.get_object_dir()?;
-        let (workdir, tmp_objects) = {
+        let global_objects = repo.0.objects.try_clone()?;
+        let workdir = {
             let d = TempDir::new_in(global_tmp)?;
             fileutils::fsetxattr(
                 d.as_fd(),
@@ -339,21 +323,14 @@ impl RepoTransaction {
                 rustix::fs::XattrFlags::empty(),
             )
             .context("setting bootid xattr")?;
-            d.create_dir("root")?;
-            d.create_dir(OBJECTS)?;
-            let objects = d.open_dir(OBJECTS)?;
-            init_object_dir(&objects)?;
-            (d, objects)
+        d
         };
-
-        let has_verity = repo.has_verity();
         let reuse_object_dirs = Arc::clone(&repo.0.reuse_object_dirs);
+        let temp_repo = Repo::init_full(&workdir, repo.has_verity(), reuse_object_dirs)?;
         let r = RepoTransaction {
-            has_verity,
             global_objects,
             workdir,
-            tmp_objects,
-            reuse_object_dirs,
+            repo: temp_repo,
         };
         Ok(r)
     }
@@ -421,10 +398,10 @@ impl RepoTransaction {
         Ok(stats)
     }
 
-    async fn commit_objects_in(&self, prefix: &str) -> Result<()> {
-        let src = Arc::new(self.tmp_objects.open_dir(prefix).context("tmp objects")?);
+    async fn commit_objects_in(from: &Dir, to: &Dir, prefix: &str) -> Result<()> {
+        let src = Arc::new(from.open_dir(prefix).context("tmp objects")?);
         let dest = Arc::new(
-            self.global_objects
+            to
                 .open_dir(prefix)
                 .context("global objects")?,
         );
@@ -451,8 +428,8 @@ impl RepoTransaction {
     }
 
     #[context("Committing objects")]
-    async fn commit_tmpobjects(&self) -> Result<()> {
-        for d in self.tmp_objects.entries()? {
+    async fn commit_objects(from: &Dir, to: &Dir) -> Result<()> {
+        for d in from.entries()? {
             let d = d?;
             if !d.file_type()?.is_dir() {
                 continue;
@@ -461,19 +438,21 @@ impl RepoTransaction {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            self.commit_objects_in(name)
+            Self::commit_objects_in(from, to, name)
                 .await
                 .with_context(|| name.to_owned())?;
         }
         Ok(())
     }
 
+    #[context("Importing object")]
     fn import_object(&self, mut tmpfile: TempFile, dest: BorrowedFd, path: &Path, stats: &mut ImportLayerStats) -> Result<()> {
+        let my_objects = &self.repo.0.objects;
         let size = tmpfile.as_file().metadata()?.size();
         // Compute its composefs digest.  This can be an expensive operation,
         // so in the future it'd be nice to do this is a helper thread.  However
         // doing so would significantly complicate the flow.
-        if self.has_verity {
+        if self.repo.has_verity() {
             fileutils::reopen_tmpfile_ro(&mut tmpfile).context("Reopening tmpfile")?;
             composefs::fsverity::fsverity_enable(tmpfile.as_file().as_fd())
                 .context("Failed to enable fsverity")?;
@@ -484,11 +463,11 @@ impl RepoTransaction {
         let mut buf = hex::encode(digest.get());
         buf.insert(2, '/');
         let exists_globally = self.global_objects.try_exists(&buf)?;
-        let exists_locally = !exists_globally && self.tmp_objects.try_exists(&buf)?;
+        let exists_locally = !exists_globally && my_objects.try_exists(&buf)?;
         if !(exists_globally || exists_locally) {
-            let reuse_dirs = self.reuse_object_dirs.lock().unwrap();
+            let reuse_dirs = self.repo.0.reuse_object_dirs.lock().unwrap();
             for d in reuse_dirs.iter() {
-                if linkat_optional_allow_exists(d, &buf, &self.tmp_objects, &buf)? {
+                if linkat_optional_allow_exists(d, &buf, &my_objects, &buf)? {
                     stats.external_objects_count += 1;
                     stats.external_objects_size += size;
                     return Ok(());
@@ -513,7 +492,7 @@ impl RepoTransaction {
                 stats.imported_objects_size += size;
             }
             rustix::fs::linkat(
-                self.tmp_objects.as_fd(),
+                my_objects.as_fd(),
                 &buf,
                 dest,
                 path,
@@ -533,7 +512,7 @@ impl RepoTransaction {
         stats: &mut ImportLayerStats,
     ) -> Result<()> {
         // First, spool the file content to a temporary file
-        let mut tmpfile = TempFile::new(&self.tmp_objects).context("Creating tmpfile")?;
+        let mut tmpfile = TempFile::new(&self.workdir).context("Creating tmpfile")?;
         let wrote_size = std::io::copy(&mut entry, &mut tmpfile)
             .with_context(|| format!("Copying tar entry {:?} to tmpfile", path))?;
         tmpfile.seek(std::io::SeekFrom::Start(0))?;
@@ -546,12 +525,18 @@ impl RepoTransaction {
 
         self.import_object(tmpfile, layer_root, path, stats)
     }
+
+    // 
+    async fn commit(self) -> Result<()> {
+        Self::commit_objects(&self.repo.0.objects, &self.global_objects).await
+    }
 }
 
 #[derive(Debug)]
 struct RepoInner {
     dir: Dir,
     bootid: &'static str,
+    objects: Dir,
     reuse_object_dirs: Arc<Mutex<Vec<Dir>>>,
     meta: RepoMetadata,
 }
@@ -562,6 +547,12 @@ pub struct Repo(Arc<RepoInner>);
 impl Repo {
     #[context("Initializing repo")]
     pub fn init(dir: &Dir, require_verity: bool) -> Result<Self> {
+        let reuse_object_dirs = Arc::new(Mutex::new(Vec::new()));
+        Self::init_full(dir, require_verity, reuse_object_dirs)
+    }
+
+    fn init_full(dir: &Dir, require_verity: bool, reuse_object_dirs: SharedObjectDirs) -> Result<Self> {
+
         let supports_verity = test_fsverity_in(&dir)?;
         if require_verity && !supports_verity {
             anyhow::bail!("Requested fsverity, but target does not support it");
@@ -595,19 +586,20 @@ impl Repo {
         }
 
         dir.ensure_dir_with(TMP, dirbuilder)?;
-        Self::impl_open(dir.try_clone()?)
+        Self::impl_open(dir.try_clone()?, reuse_object_dirs)
     }
 
-    fn impl_open(dir: Dir) -> Result<Self> {
+    fn impl_open(dir: Dir, reuse_object_dirs: SharedObjectDirs) -> Result<Self> {
         let bootid = get_bootid();
         let meta = serde_json::from_reader(
             dir.open(REPOMETA)
                 .map(std::io::BufReader::new)
                 .with_context(|| format!("Opening {REPOMETA}"))?,
         )?;
-        let reuse_object_dirs = Arc::new(Mutex::new(Vec::new()));
+        let objects = dir.open_dir(OBJECTS).context(OBJECTS)?;
         let inner = Arc::new(RepoInner {
             dir,
+            objects,
             bootid,
             meta,
             reuse_object_dirs,
@@ -617,7 +609,7 @@ impl Repo {
 
     #[context("Opening composefs-oci repo")]
     pub fn open(dir: Dir) -> Result<Self> {
-        Self::impl_open(dir)
+        Self::impl_open(dir, Default::default())
     }
 
     /// Path to a directory with a composefs objects/ directory
@@ -665,10 +657,6 @@ impl Repo {
         self.0.dir.try_exists(path).map_err(Into::into)
     }
 
-    fn get_object_dir(&self) -> Result<Dir> {
-        self.0.dir.open_dir(OBJECTS).context(OBJECTS)
-    }
-
     #[context("Importing layer")]
     pub async fn import_layer(&self, src: File, diffid: &str) -> Result<ImportLayerStats> {
         let mut layer_path = format!("{IMAGES}/{LAYERS}");
@@ -687,7 +675,7 @@ impl Repo {
             anyhow::Ok((tx, stats))
         })
         .await??;
-        tx.commit_tmpobjects().await?;
+        tx.commit().await?;
         Ok(stats)
     }
 
@@ -698,7 +686,7 @@ impl Repo {
         imgref: &str,
     ) -> Result<Descriptor> {
         let img = proxy.open_image(&imgref).await?;
-        let tx = RepoTransaction::new(&self)?;
+        let _tx = RepoTransaction::new(&self)?;
         let (manifest_digest, raw_manifest) = proxy.fetch_manifest_raw_oci(&img).await?;
         let manifest_descriptor = Descriptor::new(
             ocidir::oci_spec::image::MediaType::ImageManifest,
@@ -708,9 +696,9 @@ impl Repo {
 
         if self.has_artifact_manifest(&manifest_descriptor)? {
             println!("Already stored: {manifest_digest}");
-            return Ok(manifest_descriptor.into());
+            return Ok(manifest_descriptor);
         }
-        let config = proxy.fetch_config(&img).await?;
+        let _config = proxy.fetch_config(&img).await?;
         // let platform = PlatformBuilder::default()
         //     .architecture(config.architecture().clone())
         //     .os(config.os().clone())
@@ -740,7 +728,7 @@ impl Repo {
             let import_task = tokio::task::spawn_blocking(move || -> Result<_> {
                 let mut blobwriter = DescriptorWriter::new(&repo.0.dir)?;
                 let _n: u64 = std::io::copy(&mut sync_blob_reader, &mut blobwriter)?;
-                let tmpf = blobwriter.finish_validate(&layer)?;
+                let _tmpf = blobwriter.finish_validate(&layer)?;
                 let mut objpath = String::from(OBJECTS_BY_SHA256);
                 append_object_path(&mut objpath, &layer.sha256()?)?;
                 Ok(layer)
@@ -761,7 +749,7 @@ impl Repo {
 
     /// Ensure that a downloaded OCI image is "expanded" (unpacked)
     /// into the composefs-native store.
-    pub async fn expand(&self, manifest_desc: &Descriptor) -> Result<ImportLayerStats> {
+    pub async fn expand(&self, _manifest_desc: &Descriptor) -> Result<ImportLayerStats> {
         todo!()
         // let repo = self.clone();
         // let manifest_desc = manifest_desc.clone();
@@ -865,7 +853,7 @@ impl Add for ImportLayerStats {
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{BufReader, BufWriter},
+        io::{BufWriter},
         process::Command,
     };
 

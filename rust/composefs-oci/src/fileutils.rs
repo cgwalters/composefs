@@ -11,7 +11,6 @@ use cap_std_ext::{
 };
 use rustix::{
     fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
-    fs::openat,
 };
 
 /// The default permissions set for directories; we assume
@@ -66,7 +65,7 @@ pub(crate) fn ensure_dir(fd: BorrowedFd, p: &Path) -> io::Result<bool> {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             let st = rustix::fs::statat(fd, p, AtFlags::SYMLINK_NOFOLLOW)?;
-            if !(st.st_mode & libc::S_IFDIR > 0) {
+            if st.st_mode & libc::S_IFDIR <= 0 {
                 // TODO use https://doc.rust-lang.org/std/io/enum.ErrorKind.html#variant.NotADirectory
                 // once it's stable.
                 return Err(io::Error::new(io::ErrorKind::Other, "Found non-directory"));

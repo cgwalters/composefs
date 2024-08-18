@@ -2,11 +2,11 @@ use std::ffi::OsString;
 
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
-use cap_std_ext::dirext::CapStdExtDirExt;
+
 use clap::Parser;
 use ocidir::cap_std::{
     self,
-    fs::{Dir, DirBuilder},
+    fs::{Dir},
 };
 use pull::cli_pull;
 
