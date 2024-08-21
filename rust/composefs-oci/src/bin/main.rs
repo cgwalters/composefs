@@ -42,7 +42,7 @@ fn main() {
     // main simply invokes a run() where all the work is done.
     // This code just captures any errors.
     if let Err(e) = run() {
-        eprintln!("{:#}", e);
+        eprintln!("error: {:#}", e);
         std::process::exit(1);
     }
 }
