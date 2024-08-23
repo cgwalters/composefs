@@ -8,10 +8,15 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fmt::Display;
 use std::fmt::Write as WriteFmt;
+use std::io::BufRead;
+use std::io::Read;
 use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::str::FromStr;
+use std::sync::mpsc;
+use std::thread::JoinHandle;
 
 use anyhow::Context;
 use anyhow::{anyhow, Result};
@@ -476,6 +481,143 @@ impl<'p> Display for Entry<'p> {
         }
         std::fmt::Result::Ok(())
     }
+}
+
+#[derive(Debug)]
+struct DumpFileIteratorInner {
+    recv: mpsc::Receiver<Result<Entry<'static>>>,
+}
+
+impl Iterator for DumpFileIteratorInner {
+    type Item = Result<Entry<'static>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.recv.recv() {
+            Ok(r) => Some(r),
+            Err(_) => None,
+        }
+    }
+}
+
+/// Iterator over dumpfile entries.
+#[derive(Debug)]
+pub struct DumpFileIterator {
+    proc: Option<std::process::Child>,
+    inner: DumpFileIteratorInner,
+    input_copier: Option<JoinHandle<Result<()>>>,
+    stderr_copier: Option<JoinHandle<Result<Vec<u8>>>>,
+    output_copier: Option<JoinHandle<mpsc::SyncSender<Result<Entry<'static>>>>>,
+}
+
+impl Iterator for DumpFileIterator {
+    type Item = Result<Entry<'static>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(v) = self.inner.next() {
+            return Some(v);
+        }
+        self.finish();
+        None
+    }
+}
+
+impl DumpFileIterator {
+    fn finish(&mut self) {
+        let Some(mut proc) = self.proc.take() else {
+            // This should only happen if next() is invoked more than once
+            return;
+        };
+        let r = proc.wait();
+        // Ensure that all other values are sent
+        let Some(output_copier) = self.output_copier.take() else {
+            return;
+        };
+        let Some(stderr_copier) = self.stderr_copier.take() else {
+            return;
+        };
+        let sender = output_copier.join().unwrap();
+        let r = match r {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = sender.send(Err(e.into()));
+                return;
+            }
+        };
+        let stderr = stderr_copier.join().unwrap();
+        if r.success() {
+            return;
+        }
+        let stderr = match stderr {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = sender.send(Err(e.into()));
+                return;
+            }
+        };
+        let stderr = String::from_utf8_lossy(&stderr);
+        let stderr = stderr.trim();
+        let _ = sender.send(Err(anyhow::anyhow!("composefs-info dump failed: {r}: {stderr}")));
+    }
+}
+
+/// Configuration for parsing a dumpfile
+#[derive(Debug)]
+pub struct DumpConfig<'a> {
+    /// Only dump these toplevel filenames
+    pub filters: Option<&'a [&'a str]>,
+}
+
+/// Parse the provided composefs into dumpfile entries.
+pub fn dump(input: impl Read + Send + 'static, config: DumpConfig) -> Result<DumpFileIterator> {
+    let mut input = std::io::BufReader::new(input);
+    let mut proc = Command::new("composefs-info");
+    proc.args(["-", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut proc = proc.spawn().context("Spawning composefs-info")?;
+
+    // Buffering is a good idea in general to avoid unbounded memory allocations
+    let (send, recv) = std::sync::mpsc::sync_channel(5);
+
+    // SAFETY: we set up stdin
+    let mut child_stdin = std::io::BufWriter::new(proc.stdin.take().unwrap());
+    let mut child_stdout = std::io::BufReader::new(proc.stdout.take().unwrap());
+    let mut child_stderr = std::io::BufReader::new(proc.stderr.take().unwrap());
+
+    let input_copier = std::thread::spawn(move || -> anyhow::Result<()> {
+        std::io::copy(&mut input, &mut child_stdin)?;
+        Ok(())
+    });
+    let stderr_copier = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        std::io::copy(&mut child_stderr, &mut buf)?;
+        Ok(buf)
+    });
+    let output_copier = std::thread::spawn(move || {
+        for line in child_stdout.lines() {
+            let line = match line {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = send.send(Err(e.into()));
+                    return send;
+                }
+            };
+            let entry = Entry::parse(&line);
+        }
+        send
+    });
+    let inner = DumpFileIteratorInner {
+        recv,
+    };
+    let mut r = DumpFileIterator {
+        proc: Some(proc),
+        inner,
+        input_copier: Some(input_copier),
+        stderr_copier: Some(stderr_copier),
+        output_copier: Some(output_copier),
+    };
+    Ok(r)
 }
 
 #[cfg(test)]
