@@ -167,6 +167,8 @@ jobs:
       - run: sudo tar -C / -xvf composefs.tar
       - name: Integration tests
         run: sudo ./tests/integration.sh
+      - name: Integration tests (fsverity required)
+        run: sudo env WITH_TEMP_VERITY=1 unshare -m ./tests/integration.sh
   rust:
     needs: build-noasan
     runs-on: ubuntu-latest
