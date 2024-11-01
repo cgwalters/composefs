@@ -4,18 +4,6 @@
 # the output of ls -lR (without hardlink counts).
 set -xeuo pipefail
 
-# Set to setup an explicit temporary ext4 loopback mounted fs with fsverity
-WITH_TEMP_VERITY=${WITH_TEMP_VERITY:-}
-if test -n "${WITH_TEMP_VERITY}"; then
-    tmpdisk=$(mktemp -p /var/tmp)
-    truncate -s 100G ${tmpdisk}
-    mkfs.ext4 -O verity ${tmpdisk}
-    tmp_mnt=$(mktemp -d)
-    mount -o loop ${tmpdisk} ${tmp_mnt}
-    rm -f ${tmpdisk}
-    cfsroot=${tmp_mnt}
-fi
-
 orig=$(pwd)
 cfsroot=${cfsroot:-/composefs}
 rm ${cfsroot}/tmp -rf
@@ -68,7 +56,7 @@ echo "fsverity test" > ${cfsroot}/test-fsverity
 if fsverity enable ${cfsroot}/test-fsverity; then
     echo "fsverity is supported"
 else
-    if test -n "${WITH_TEMP_VERITY}"; then
+    if test -n "${CI_VERITY_REQUIRED}"; then
         echo "fsverity unsupported, but is required" 1>&2
         exit 1
     fi

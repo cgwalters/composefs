@@ -156,6 +156,8 @@ jobs:
       - run: sudo apt-get update -y
       - name: Install erofs kmod
         run: sudo apt install linux-modules-extra-$(uname -r)
+      - name: Enable verity
+        run: sudo tune2fs -O verity $(findmnt -vno SOURCE /)
       - name: Install dependencies
         run: sudo apt install libasan6 libubsan1 fsverity
       - name: Checkout repository
@@ -166,9 +168,7 @@ jobs:
           name: composefs.tar
       - run: sudo tar -C / -xvf composefs.tar
       - name: Integration tests
-        run: sudo ./tests/integration.sh
-      - name: Integration tests (fsverity required)
-        run: sudo env WITH_TEMP_VERITY=1 unshare -m ./tests/integration.sh
+        run: sudo env CI_VERITY_REQUIRED=1 ./tests/integration.sh
   rust:
     needs: build-noasan
     runs-on: ubuntu-latest
